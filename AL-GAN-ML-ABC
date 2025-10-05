@@ -1,21 +1,13 @@
 """
-Stroke Active Learning Pipeline (from paper-inspired design)
-
+Stroke Active Learning Pipeline
 Modules:
-  - data: ISLES/BMRID loaders + preprocessing
-  - gan: Online augmentation GAN with selective gradient omission
-  - model: Multi-branch CNN classifier
-  - rl: PPO agent with Scope Loss (SLF) for active learning sample selection
+  - data: ISLES/BMRID loaders + preprocessing (resize → [0,1] → z-score → Gaussian smoothing → optional histogram equalization → slice alignment & orientation normalization)
+  - gan: Online augmentation GAN with selective gradient omission (configurable num layers)
+  - model: Multi-branch CNN classifier (configurable activation, dropout, #conv layers)
+  - rl: PPO agent with Scope Loss (SLF) for AL sample selection (configurable MLP depth)
   - al_loop: End-to-end active learning cycle integrating classifier, RL agent, and GAN
   - hpo: Random-Key + Mutual-Learning Artificial Bee Colony (ML-ABC) hyperparameter optimizer
 
-Notes:
-  • Code is written to be executable end-to-end on 2D slices; adjust I/O paths for real datasets.
-  • Comments and docstrings are in English as requested.
-  • Heavy training is parameterized; defaults run a tiny demo if invoked with --demo.
-
-Author: Python Assistant
-"""
 from __future__ import annotations
 
 import os
@@ -24,7 +16,7 @@ import random
 import time
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 import numpy as np
 
@@ -63,16 +55,38 @@ def to_device(batch: Any, device: torch.device) -> Any:
 # ==========================================================
 
 class MRITransform:
-    """Preprocessing composed of resize -> [0,1] scale -> z-score -> optional blur/equalize.
+    """Preprocessing pipeline for MRI slices.
 
-    This mirrors the paper's preprocessing: resize to 224, scale to [0,1], z-score per scan,
-    Gaussian smoothing, optional histogram equalization.
+    Steps (as requested):
+      1) Resize to 224×224 (CNN input compatibility)
+      2) Scale pixel values to [0, 1] (training stability)
+      3) Z-score standardization per-scan (scanner/protocol normalization)
+      4) Gaussian smoothing for noise reduction
+      5) Optional histogram equalization for low-contrast scans
+      6) Slice alignment and orientation normalization (consistency of anatomy)
+
+    Notes:
+      • Alignment is implemented via intensity centroiding to center anatomy; orientation is normalized
+        with a simple heuristic (left-right intensity profile) or forced via parameters.
+      • For production-grade MRI orientation handling, consider reading acquisition headers
+        (e.g., nibabel + orientation codes). Here we implement a robust heuristic without extra deps.
     """
 
-    def __init__(self, apply_blur: bool = True, apply_eq: bool = False, image_size: int = 224):
+    def __init__(
+        self,
+        apply_blur: bool = True,
+        apply_eq: bool = False,
+        image_size: int = 224,
+        normalize_orientation: bool = True,
+        align_slices: bool = True,
+        force_flip_lr: Optional[bool] = None,
+    ):
         self.apply_blur = apply_blur
         self.apply_eq = apply_eq
         self.image_size = image_size
+        self.normalize_orientation = normalize_orientation
+        self.align_slices = align_slices
+        self.force_flip_lr = force_flip_lr  # if True/False forces LR flip/keep; None → auto
         ops = [
             transforms.ToPILImage(),
             transforms.Resize((image_size, image_size)),
@@ -82,32 +96,80 @@ class MRITransform:
         self.blur = transforms.GaussianBlur(kernel_size=3) if apply_blur else None
 
     def __call__(self, img: np.ndarray) -> torch.Tensor:
-        # img expected as HxW or HxWxC array in uint8 or float [0, 255]
+        # Accept HxW or HxWxC (uint8 or float)
         if img.ndim == 2:
             img = np.expand_dims(img, -1)
-        if img.shape[2] == 1:  # grayscale -> 3ch
+        if img.shape[2] == 1:  # grayscale → 3ch
             img = np.repeat(img, 3, axis=2)
         img = img.astype(np.float32)
         if img.max() > 1.5:
             img = img / 255.0
-        ten = self.base(img)
+        ten = self.base(img)  # [C,H,W] in [0,1]
         if self.blur is not None:
             ten = self.blur(ten)
         if self.apply_eq:
-            # simple per-channel histogram equalization via ranking (approx)
             ten = torch.stack([_rank_equalize(ten[c]) for c in range(ten.shape[0])], dim=0)
-        # z-score per image
+        # z-score per image (per-scan approximation for 2D slice)
         mean = ten.mean()
         std = ten.std().clamp_min(1e-6)
         ten = (ten - mean) / std
+        # Alignment (center-of-mass to center of frame)
+        if self.align_slices:
+            ten = _center_align_tensor(ten)
+        # Orientation normalization (left-right)
+        if self.normalize_orientation:
+            ten = _normalize_left_right(ten, force_flip_lr=self.force_flip_lr)
         return ten
 
 
 def _rank_equalize(channel: torch.Tensor) -> torch.Tensor:
-    """Approximate histogram equalization using rank-based mapping per image channel."""
+    """Approx. histogram equalization via per-image rank mapping."""
     flat = channel.flatten()
     ranks = flat.argsort().argsort().float() / (flat.numel() - 1)
     return ranks.view_as(channel)
+
+
+def _center_align_tensor(x: torch.Tensor) -> torch.Tensor:
+    """Shift the image so intensity centroid is near the spatial center.
+
+    Implementation is translation-only using integer pixel shifts (torch.roll), channel-wise preserved.
+    """
+    with torch.no_grad():
+        c, h, w = x.shape
+        # Compute weights from positive intensities (avoid negatives after z-score)
+        xx = x.clamp_min(0)
+        grid_y = torch.arange(h, device=x.device).float()
+        grid_x = torch.arange(w, device=x.device).float()
+        Y, X = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        # average over channels
+        weights = xx.mean(0)
+        total = weights.sum().clamp_min(1e-6)
+        cy = (Y * weights).sum() / total
+        cx = (X * weights).sum() / total
+        shift_y = int(round(h / 2 - cy.item()))
+        shift_x = int(round(w / 2 - cx.item()))
+        x = torch.roll(x, shifts=(shift_y, shift_x), dims=(1, 2))
+        return x
+
+
+def _normalize_left_right(x: torch.Tensor, force_flip_lr: Optional[bool] = None) -> torch.Tensor:
+    """Normalize left-right orientation.
+
+    Heuristic: compare mean intensity of left vs right halves (after smoothing). If forced, obey flag.
+    """
+    if force_flip_lr is True:
+        return torch.flip(x, dims=[2])
+    if force_flip_lr is False:
+        return x
+    # auto
+    with torch.no_grad():
+        c, h, w = x.shape
+        left = x[:, :, : w // 2].abs().mean()
+        right = x[:, :, w // 2 :].abs().mean()
+        # flip if right>left to enforce a canonical convention (left-half brighter)
+        if right > left:
+            x = torch.flip(x, dims=[2])
+        return x
 
 
 class SimpleFolderMRIDataset(Dataset):
@@ -119,12 +181,10 @@ class SimpleFolderMRIDataset(Dataset):
           img_*.npy | .pt | .png | .jpg
         class_1/
           ...
-    
-    • For MRI volumes, provide pre-extracted 2D slices as images or .npy arrays.
-    • This example treats each file as one image (2D). Extend to 3D if needed.
+    For MRI volumes, provide pre-extracted 2D slices as images or .npy arrays.
     """
 
-    def __init__(self, root: str, transform: Optional[callable] = None):
+    def __init__(self, root: str, transform: Optional[Callable[[np.ndarray], torch.Tensor]] = None):
         super().__init__()
         self.root = root
         self.transform = transform or MRITransform()
@@ -147,7 +207,6 @@ class SimpleFolderMRIDataset(Dataset):
         elif path.endswith(".pt"):
             img = torch.load(path).numpy()
         else:
-            # Load with PIL via torchvision
             from PIL import Image
             img = np.array(Image.open(path).convert("L"))
         x = self.transform(img)
@@ -155,7 +214,6 @@ class SimpleFolderMRIDataset(Dataset):
         return x, y
 
 
-# Convenience aliases the paper mentions (ISLES / BMRID) for clarity
 ISLESDataset = SimpleFolderMRIDataset
 BMRIDDataset = SimpleFolderMRIDataset
 
@@ -164,60 +222,74 @@ BMRIDDataset = SimpleFolderMRIDataset
 # GAN for online augmentation w/ selective gradient omission
 # ==========================================================
 
-class DiscFeatures(nn.Module):
-    """Discriminator returning features from last conv block and real/fake logits.
+class FlexibleDisc(nn.Module):
+    """Configurable discriminator returning features and real/fake logits.
 
-    Architecture matches paper text: 3 conv blocks, BN, LeakyReLU, strides 1/2/2, kernel 3x3, pad 1.
+    conv_layers: number of conv blocks (2–10). Each block: Conv3×3(stride 1 or 2) → BN → LeakyReLU.
+    Stride pattern doubles resolution reduction every other block.
     """
 
-    def __init__(self, in_ch: int = 3, base: int = 64):
+    def __init__(self, in_ch: int = 3, base: int = 64, conv_layers: int = 3, image_size: int = 224):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_ch, base, 3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(base)
-        self.conv2 = nn.Conv2d(base, base * 2, 3, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(base * 2)
-        self.conv3 = nn.Conv2d(base * 2, base * 4, 3, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(base * 4)
-        self.head = nn.Linear(base * 4 * 56 * 56, 1)  # assuming 224x224 input
+        convs, bns = [], []
+        c_in = in_ch
+        c = base
+        for i in range(conv_layers):
+            stride = 2 if i > 0 else 1
+            convs.append(nn.Conv2d(c_in, c, 3, stride=stride, padding=1))
+            bns.append(nn.BatchNorm2d(c))
+            c_in = c
+            c = min(c * 2, base * 8)
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+        # compute flatten size
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, image_size, image_size)
+            h = dummy
+            for i in range(conv_layers):
+                h = F.leaky_relu(self.bns[i](self.convs[i](h)), negative_slope=0.2)
+            feat_dim = h.view(1, -1).size(1)
+        self.head = nn.Linear(feat_dim, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        h = F.leaky_relu(self.bn1(self.conv1(x)), negative_slope=0.2)
-        h = F.leaky_relu(self.bn2(self.conv2(h)), negative_slope=0.2)
-        h = F.leaky_relu(self.bn3(self.conv3(h)), negative_slope=0.2)
+        h = x
+        for conv, bn in zip(self.convs, self.bns):
+            h = F.leaky_relu(bn(conv(h)), negative_slope=0.2)
         feat = h.view(h.size(0), -1)
         logit = self.head(feat)
         return feat, logit
 
 
-class Generator(nn.Module):
-    """Deconvolutional generator with dual input: noise z and optional discriminator features.
+class FlexibleGen(nn.Module):
+    """Configurable deconvolutional generator.
 
-    Deconv blocks: 4x 4x4 / stride 2 / pad 1; ReLU except final Tanh.
-    If cond features given, they are projected and concatenated to z before upsampling.
+    deconv_layers: number of deconv blocks (2–10): [ConvT → BN → ReLU]* (final Tanh).
     """
 
-    def __init__(self, z_dim: int = 100, feat_dim: int = 56 * 56 * 256, out_ch: int = 3, base: int = 64):
+    def __init__(self, z_dim: int = 100, feat_dim: int = 56 * 56 * 256, out_ch: int = 3, base: int = 64, deconv_layers: int = 4):
         super().__init__()
         self.feat_proj = nn.Linear(feat_dim, z_dim)
-        self.fc = nn.Linear(z_dim, base * 8 * 14 * 14)
-        self.deconv1 = nn.ConvTranspose2d(base * 8, base * 4, 4, stride=2, padding=1)
-        self.bn1 = nn.BatchNorm2d(base * 4)
-        self.deconv2 = nn.ConvTranspose2d(base * 4, base * 2, 4, stride=2, padding=1)
-        self.bn2 = nn.BatchNorm2d(base * 2)
-        self.deconv3 = nn.ConvTranspose2d(base * 2, base, 4, stride=2, padding=1)
-        self.bn3 = nn.BatchNorm2d(base)
-        self.deconv4 = nn.ConvTranspose2d(base, out_ch, 4, stride=2, padding=1)
+        # Start from a small spatial seed
+        self.seed_hw = 14
+        self.fc = nn.Linear(z_dim, base * 8 * self.seed_hw * self.seed_hw)
+        # Build deconvs
+        chans = [base * 8]
+        for i in range(deconv_layers - 1):
+            chans.append(max(base, chans[-1] // 2))
+        self.deconvs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(deconv_layers - 1):
+            self.deconvs.append(nn.ConvTranspose2d(chans[i], chans[i + 1], 4, stride=2, padding=1))
+            self.bns.append(nn.BatchNorm2d(chans[i + 1]))
+        self.final = nn.ConvTranspose2d(chans[-1], out_ch, 4, stride=2, padding=1)
 
     def forward(self, z: torch.Tensor, cond_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
         if cond_feat is not None:
-            cf = self.feat_proj(cond_feat)
-            z = z + cf  # simple fusion
-        h = self.fc(z)
-        h = h.view(h.size(0), -1, 14, 14)
-        h = F.relu(self.bn1(self.deconv1(h)))
-        h = F.relu(self.bn2(self.deconv2(h)))
-        h = F.relu(self.bn3(self.deconv3(h)))
-        x = torch.tanh(self.deconv4(h))
+            z = z + self.feat_proj(cond_feat)
+        h = self.fc(z).view(z.size(0), -1, self.seed_hw, self.seed_hw)
+        for deconv, bn in zip(self.deconvs, self.bns):
+            h = F.relu(bn(deconv(h)))
+        x = torch.tanh(self.final(h))
         return x
 
 
@@ -228,6 +300,8 @@ class GANConfig:
     lr_g: float = 6e-3
     lr_d: float = 2e-3
     recon_w: float = 0.3  # optional L1 towards real sample
+    d_layers: int = 3
+    g_layers: int = 4
 
 
 class OnlineAugGAN:
@@ -238,11 +312,15 @@ class OnlineAugGAN:
         batch = gan.maybe_augment(real_batch, labels, p_retain=0.6)
     """
 
-    def __init__(self, device: torch.device, cfg: GANConfig = GANConfig()):
+    def __init__(self, device: torch.device, cfg: GANConfig = GANConfig(), image_size: int = 224):
         self.device = device
         self.cfg = cfg
-        self.D = DiscFeatures().to(device)
-        self.G = Generator(z_dim=cfg.z_dim).to(device)
+        self.D = FlexibleDisc(conv_layers=cfg.d_layers, image_size=image_size).to(device)
+        # temporary forward to infer feat_dim for generator
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size).to(device)
+            feat_dim, _ = self.D(dummy)
+        self.G = FlexibleGen(z_dim=cfg.z_dim, feat_dim=feat_dim.size(1), deconv_layers=cfg.g_layers).to(device)
         self.optD = torch.optim.Adam(self.D.parameters(), lr=cfg.lr_d, betas=(0.5, 0.999))
         self.optG = torch.optim.Adam(self.G.parameters(), lr=cfg.lr_g, betas=(0.5, 0.999))
 
@@ -267,29 +345,22 @@ class OnlineAugGAN:
 
         # ---------------- G step with selective omission ----------------
         self.optG.zero_grad()
-        # re-evaluate with current D
         feat_r, _ = self.D(real)
         fake = self.G(z, feat_r.detach())
         _, logit_f2 = self.D(fake)
-        # Top-k omission: omit gradients for samples with top-k highest D scores
         k = max(1, int(self.cfg.topk_frac * b))
         scores = logit_f2.detach().view(-1)
         topk_idx = torch.topk(scores, k=k, largest=True).indices
         weight = torch.ones_like(scores)
         weight[topk_idx] = 0.0
-        loss_vec = F.softplus(-logit_f2.view(-1))  # generator tries to increase D(fake)
-        # Optional L1 reconstruction towards a random real image in the batch
+        loss_vec = F.softplus(-logit_f2.view(-1))
         recon = self.cfg.recon_w * (fake - real[torch.randperm(b, device=self.device)]).abs().mean(dim=(1, 2, 3))
         loss_g = ((loss_vec + recon) * weight).sum() / weight.clamp_min(1e-6).sum()
         loss_g.backward()
         self.optG.step()
 
     def maybe_augment(self, batch_x: torch.Tensor, labels: torch.Tensor, p_retain: float = 0.6) -> torch.Tensor:
-        """Implements Algorithm 1: online augmentation inside a mini-batch.
-
-        For each image, with probability (1 - p_retain), replace with a GAN sample.
-        Conditioning uses discriminator features of the current image.
-        """
+        """Online augmentation inside a mini-batch: with prob (1 - p_retain) replace with G(z|feat)."""
         self.train_step(batch_x)
         with torch.no_grad():
             b = batch_x.size(0)
@@ -302,33 +373,43 @@ class OnlineAugGAN:
 
 
 # ==========================================================
-# Classifier: multi-branch CNN per paper
+# Classifier: multi-branch CNN per paper (configurable)
 # ==========================================================
 
+_ACTIVATIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "relu": F.relu,
+    "tanh": torch.tanh,
+    "sigmoid": torch.sigmoid,
+}
+
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, act: str = "relu", p_drop: float = 0.0):
         super().__init__()
-        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=2, stride=3, padding=4)
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1)
         self.bn = nn.BatchNorm2d(out_ch)
         self.pool = nn.MaxPool2d(2)
+        self.act = act
+        self.dropout = nn.Dropout2d(p=p_drop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pool(F.relu(self.bn(self.conv(x))))
-        return x
+        h = _ACTIVATIONS[self.act](self.bn(self.conv(x)))
+        h = self.pool(h)
+        h = self.dropout(h)
+        return h
 
 
 class BranchCNN(nn.Module):
-    """Five-layer CNN with channels 128->8 decreasing as described."""
+    """CNN branch with configurable number of layers (2–10) and activation."""
 
-    def __init__(self, in_ch: int = 3):
+    def __init__(self, in_ch: int = 3, layers: int = 5, base: int = 128, act: str = "relu", p_drop: float = 0.0):
         super().__init__()
-        chans = [128, 64, 32, 16, 8]
-        layers: List[nn.Module] = []
+        chans: List[int] = [max(base // (2 ** i), 8) for i in range(layers)]
+        blocks: List[nn.Module] = []
         c_in = in_ch
         for c in chans:
-            layers.append(ConvBlock(c_in, c))
+            blocks.append(ConvBlock(c_in, c, act=act, p_drop=p_drop))
             c_in = c
-        self.net = nn.Sequential(*layers)
+        self.net = nn.Sequential(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.net(x)
@@ -336,21 +417,33 @@ class BranchCNN(nn.Module):
 
 
 class MultiBranchClassifier(nn.Module):
-    """Stacks multiple CNN branches, concatenates features, then FC for classification."""
+    """Multiple CNN branches, concatenated features → MLP head. Configurable activation & depth."""
 
-    def __init__(self, num_classes: int = 2, in_ch: int = 3, num_branches: int = 3, feat_dim: int = 256):
+    def __init__(
+        self,
+        num_classes: int = 2,
+        in_ch: int = 3,
+        num_branches: int = 3,
+        branch_layers: int = 5,
+        act: str = "relu",
+        mlp_layers: int = 1,
+        feat_dim: int = 256,
+        dropout: float = 0.3,
+    ):
         super().__init__()
-        self.branches = nn.ModuleList([BranchCNN(in_ch) for _ in range(num_branches)])
+        self.branches = nn.ModuleList([
+            BranchCNN(in_ch, layers=branch_layers, act=act, p_drop=dropout) for _ in range(num_branches)
+        ])
         # Infer flatten size with a dummy forward
         with torch.no_grad():
             dummy = torch.zeros(1, in_ch, 224, 224)
             fsz = self.branches[0](dummy).numel()
-        self.fc = nn.Sequential(
-            nn.Linear(num_branches * fsz, feat_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(feat_dim, num_classes),
-        )
+        # Build MLP head with configurable depth
+        mlp: List[nn.Module] = [nn.Linear(num_branches * fsz, feat_dim), nn.Dropout(dropout)]
+        for _ in range(max(0, mlp_layers - 1)):
+            mlp += [nn.Linear(feat_dim, feat_dim), nn.ReLU(), nn.Dropout(dropout)]
+        mlp += [nn.Linear(feat_dim, num_classes)]
+        self.fc = nn.Sequential(*mlp)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         feats = [b(x) for b in self.branches]
@@ -370,23 +463,23 @@ class PPOConfig:
     clip_eps: float = 0.2
     lr: float = 1e-3
     entropy_coef: float = 0.01
-    scope_alpha: float = 0.5  # scales scope vs advantage
-    scope_gamma: float = 2.0  # focusing factor (like focal loss gamma)
+    scope_alpha: float = 0.5  # certainty modulator α
+    scope_gamma: float = 0.5  # curvature control γ (0–1 per Table 1)
     train_iters: int = 4
     batch_size: int = 64
+    mlp_layers: int = 1
 
 
 class PolicyNet(nn.Module):
-    """Small MLP policy over state -> action (2) and value."""
+    """Small configurable MLP policy over state → action (2) and value."""
 
-    def __init__(self, state_dim: int, hidden: int = 256):
+    def __init__(self, state_dim: int, hidden: int = 256, mlp_layers: int = 1):
         super().__init__()
-        self.pi = nn.Sequential(
-            nn.Linear(state_dim, hidden), nn.ReLU(), nn.Linear(hidden, 2)
-        )
-        self.v = nn.Sequential(
-            nn.Linear(state_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1)
-        )
+        layers: List[nn.Module] = [nn.Linear(state_dim, hidden), nn.ReLU()]
+        for _ in range(max(0, mlp_layers - 1)):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+        self.pi = nn.Sequential(*layers, nn.Linear(hidden, 2))
+        self.v = nn.Sequential(*layers, nn.Linear(hidden, 1))
 
     def forward(self, s: torch.Tensor) -> Tuple[torch.distributions.Categorical, torch.Tensor]:
         logits = self.pi(s)
@@ -439,22 +532,20 @@ def compute_gae(r, v, done, gamma: float, lam: float) -> Tuple[torch.Tensor, tor
 
 
 def scope_scale(prob: torch.Tensor, adv: torch.Tensor, alpha: float, gamma_f: float) -> torch.Tensor:
-    """Implements Scope Loss scaling factor.
+    """Scope Loss scaling factor.
 
-    • Normalize advantages with z-score within batch
-    • scope = (1 - prob) ** gamma_f * (alpha + |adv_z|)
-    • Returns multiplicative factor for policy loss term
+    Normalize advantages with z-score, then: scope = (1 - prob)^γ * (α + |adv_z|).
     """
     adv_z = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
     scope = torch.pow(1.0 - prob.detach().clamp(1e-6, 1.0), gamma_f) * (alpha + adv_z.abs())
-    return scope.detach()  # used as weight
+    return scope.detach()
 
 
 class PPOWithScope:
     def __init__(self, state_dim: int, cfg: PPOConfig, device: torch.device):
         self.cfg = cfg
         self.device = device
-        self.net = PolicyNet(state_dim).to(device)
+        self.net = PolicyNet(state_dim, mlp_layers=cfg.mlp_layers).to(device)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
 
     def update(self, buf: TrajBuffer) -> Dict[str, float]:
@@ -481,6 +572,1783 @@ class PPOWithScope:
                 logp = dist.log_prob(a[mb])
                 ratio = torch.exp(logp - logp_old[mb])
                 prob_a = torch.exp(dist.logits.gather(1, a[mb].unsqueeze(1)).squeeze(1) - dist.logits.logsumexp(1))
-                # Scope factor scales the unclipped policy loss
                 scope = scope_scale(prob_a, adv[mb], self.cfg.scope_alpha, self.cfg.scope_gamma)
                 pg_unclipped = -ratio * adv[mb] * scope
+                pg_clipped = -torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps) * adv[mb] * scope
+                pg_loss = torch.max(pg_unclipped, pg_clipped).mean()
+                v_loss = F.mse_loss(v_pred, ret[mb])
+                ent = dist.entropy().mean()
+                loss = pg_loss + 0.5 * v_loss - self.cfg.entropy_coef * ent
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+                losses = {
+                    "pg": float(pg_loss.item()),
+                    "v": float(v_loss.item()),
+                    "ent": float(ent.item()),
+                }
+        return losses
+
+
+# ==========================================================
+# Active Learning Loop
+# ==========================================================
+
+@dataclass
+class ALConfig:
+    label_budget: int = 200
+    batch_size: int = 32
+    epochs_per_round: int = 1
+    rl_steps_per_round: int = 200
+    not_label_penalty: float = 0.0
+    label_penalty: float = -0.05  # small negative reward to discourage over-labeling
+    p_retain_aug: float = 0.6
+
+
+class ActiveLearningSystem:
+    """End-to-end active learning system tying everything together."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        device: torch.device,
+        al_cfg: ALConfig,
+        ppo_cfg: PPOConfig,
+        gan_cfg: GANConfig,
+        num_branches: int = 3,
+        branch_layers: int = 5,
+        activation: str = "relu",
+        mlp_layers: int = 1,
+        dropout: float = 0.3,
+    ):
+        self.device = device
+        self.al_cfg = al_cfg
+        self.classifier = MultiBranchClassifier(
+            num_classes=num_classes,
+            num_branches=num_branches,
+            branch_layers=branch_layers,
+            act=activation,
+            mlp_layers=mlp_layers,
+            dropout=dropout,
+        ).to(device)
+        self.opt_cls = torch.optim.Adam(self.classifier.parameters(), lr=1e-3)
+        # RL state will be: [feat_vector || softmax_probs]
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224).to(device)
+            _, f = self.classifier(dummy)
+            state_dim = f.size(1) + num_classes
+        ppo_cfg.mlp_layers = mlp_layers
+        self.agent = PPOWithScope(state_dim, ppo_cfg, device)
+        self.gan = OnlineAugGAN(device, gan_cfg)
+        self.num_classes = num_classes
+
+    def _class_centers(self, loader: DataLoader) -> torch.Tensor:
+        """Compute feature means per class from labeled data for entropy reward."""
+        sums = [torch.zeros(0, device=self.device)] * self.num_classes
+        cnt = [0] * self.num_classes
+        self.classifier.eval()
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                _, f = self.classifier(x)
+                for c in range(self.num_classes):
+                    mask = (y == c)
+                    if mask.any():
+                        fs = f[mask]
+                        if cnt[c] == 0:
+                            sums[c] = fs.sum(dim=0)
+                        else:
+                            sums[c] = sums[c] + fs.sum(dim=0)
+                        cnt[c] += int(mask.sum().item())
+        centers = []
+        for c in range(self.num_classes):
+            if cnt[c] == 0:
+                centers.append(torch.zeros_like(sums[0]))
+            else:
+                centers.append(sums[c] / cnt[c])
+        return torch.stack(centers, dim=0)
+
+    def _entropy_reward(self, feat: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+        """Entropy-like reward using distances to class centers as logits."""
+        d = torch.cdist(feat.unsqueeze(0), centers).squeeze(0)  # [C]
+        logits = -d
+        prob = F.softmax(logits, dim=0)
+        ent = -(prob * (prob.clamp_min(1e-6)).log()).sum()
+        return ent
+
+    def train_classifier(self, loader: DataLoader, epochs: int = 1) -> None:
+        self.classifier.train()
+        for _ in range(epochs):
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                x = self.gan.maybe_augment(x, y, p_retain=self.al_cfg.p_retain_aug)
+                logits, _ = self.classifier(x)
+                p = F.softmax(logits, dim=1)
+                y_onehot = F.one_hot(y, num_classes=self.num_classes).float()
+                pt = (p * y_onehot).sum(dim=1).clamp(1e-6, 1.0)
+                gamma = 2.0
+                loss = (-(1 - pt) ** gamma * pt.log()).mean()
+                self.opt_cls.zero_grad()
+                loss.backward()
+                self.opt_cls.step()
+
+    def active_round(
+        self,
+        unlabeled: Dataset,
+        labeled: Dataset,
+        steps: int,
+        label_budget: int,
+        train_epochs: int,
+    ) -> Tuple[int, Dict[str, float]]:
+        labeled_loader = DataLoader(labeled, batch_size=self.al_cfg.batch_size, shuffle=True)
+        centers = self._class_centers(labeled_loader)
+
+        buf = TrajBuffer()
+        budget_used = 0
+        self.classifier.eval()
+        for _ in range(steps):
+            idx = random.randrange(len(unlabeled))
+            x_u, _ = unlabeled[idx]
+            x_u = x_u.unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                logits, f = self.classifier(x_u)
+                prob = F.softmax(logits, dim=1)
+                state = torch.cat([f, prob], dim=1).squeeze(0)
+            dist, v = self.agent.net(state.unsqueeze(0))
+            a = dist.sample().item()  # 0: do not label, 1: label
+            logp = dist.log_prob(torch.tensor(a, device=self.device))
+
+            if a == 1 and budget_used < label_budget:
+                x_true, y_true = unlabeled[idx]
+                labeled.items.append((unlabeled.items[idx][0], y_true))
+                unlabeled.items.pop(idx)
+                reward = self.al_cfg.label_penalty
+                budget_used += 1
+            else:
+                with torch.no_grad():
+                    _, f_now = self.classifier(x_u)
+                    reward = float(self._entropy_reward(f_now.squeeze(0), centers))
+                reward += self.al_cfg.not_label_penalty
+
+            buf.add(state, a, logp.detach(), reward, v.detach(), 0.0)
+            if budget_used >= label_budget:
+                break
+
+        losses = self.agent.update(buf)
+        self.train_classifier(DataLoader(labeled, batch_size=self.al_cfg.batch_size, shuffle=True), epochs=train_epochs)
+        return budget_used, losses
+
+
+# ==========================================================
+# Hyperparameter Optimization: Random-Key + ML-ABC
+# ==========================================================
+
+@dataclass
+class HPSpace:
+    # Table 1 ranges
+    batch_size: Tuple[int, int] = (16, 512)
+    lr_min_max: Tuple[float, float] = (1e-5, 1.0)  # log-uniform sample within [~0, 1]
+    epochs: Tuple[int, int] = (8, 128)
+    activation: Tuple[str, ...] = ("ReLU", "Tanh", "Sigmoid")
+    dropout: Tuple[float, float] = (0.0, 1.0)
+    recon_w: Tuple[float, float] = (0.0, 1.0)
+    z_dim: Tuple[int, int] = (16, 512)
+    p_retain: Tuple[float, float] = (0.0, 1.0)
+    mlp_layers: Tuple[int, int] = (1, 8)
+    conv_deconv_layers: Tuple[int, int] = (2, 10)
+    ppo_clip: Tuple[float, float] = (0.1, 0.3)
+    slf_gamma: Tuple[float, float] = (0.0, 1.0)
+    slf_alpha: Tuple[float, float] = (0.01, 1.0)
+
+
+@dataclass
+class MLABCConfig:
+    pop_size: int = 16
+    onlooker_frac: float = 0.5
+    scout_patience: int = 4
+    iters: int = 12
+    reciprocal_lr: float = 0.5  # tau in mutual learning
+
+
+def _rand_between(lo: float, hi: float) -> float:
+    return lo + (hi - lo) * random.random()
+
+
+def _rand_int(lo: int, hi: int) -> int:
+    return random.randint(lo, hi)
+
+
+def _sample_log_uniform(lo: float, hi: float) -> float:
+    lo = max(lo, 1e-8)
+    r = math.log(hi) - math.log(lo)
+    return math.exp(math.log(lo) + random.random() * r)
+
+
+def sample_random_key(space: HPSpace) -> Dict[str, Any]:
+    """Sample one hyperparameter vector using a Random-Key style mapping (Table 1)."""
+    act = random.choice(space.activation)
+    act_l = act.lower()
+    return {
+        "batch_size": _rand_int(*space.batch_size),
+        "lr_cls": _sample_log_uniform(*space.lr_min_max),
+        "lr_g": _sample_log_uniform(*space.lr_min_max),
+        "lr_d": _sample_log_uniform(*space.lr_min_max),
+        "epochs": _rand_int(*space.epochs),
+        "activation": act_l,  # "relu" | "tanh" | "sigmoid"
+        "dropout": _rand_between(*space.dropout),
+        "recon_w": _rand_between(*space.recon_w),
+        "z_dim": _rand_int(*space.z_dim),
+        "p_retain": _rand_between(*space.p_retain),
+        "mlp_layers": _rand_int(*space.mlp_layers),
+        "conv_layers": _rand_int(*space.conv_deconv_layers),  # for classifier branches & D
+        "deconv_layers": _rand_int(*space.conv_deconv_layers), # for G
+        "ppo_clip": _rand_between(*space.ppo_clip),
+        "slf_gamma": _rand_between(*space.slf_gamma),
+        "slf_alpha": _rand_between(*space.slf_alpha),
+    }
+
+
+class MLABCSolver:
+    """Mutual-Learning Artificial Bee Colony (ML-ABC) optimizer.
+
+    Phases per iteration:
+      • Employed-bee: each solution explores a neighbor; if a better peer exists, move toward it (mutual learning with step τ).
+      • Onlooker-bee: select solutions with probability ∝ (fitness − min + ε); apply small perturbations.
+      • Scout-bee: if a solution stagnates for `scout_patience`, reinitialize it randomly.
+
+    Uses a Random-Key parameterization to handle mixed discrete/continuous spaces in Table 1.
+    """
+
+    def __init__(self, space: HPSpace, cfg: MLABCConfig):
+        self.space = space
+        self.cfg = cfg
+
+    def optimize(self, evaluate: Callable[[Dict[str, Any]], float]) -> Dict[str, Any]:
+        pop: List[Dict[str, Any]] = [sample_random_key(self.space) for _ in range(self.cfg.pop_size)]
+        fitness: List[float] = [evaluate(p) for p in pop]
+        trials: List[int] = [0] * self.cfg.pop_size
+
+        for _ in range(self.cfg.iters):
+            # Employed bee + mutual learning
+            for i in range(self.cfg.pop_size):
+                k = random.choice([j for j in range(self.cfg.pop_size) if j != i])
+                if fitness[k] > fitness[i]:
+                    tau = random.random() * self.cfg.reciprocal_lr
+                    for key in pop[i].keys():
+                        if isinstance(pop[i][key], int):
+                            pi = float(pop[i][key]); pk = float(pop[k][key])
+                            pop[i][key] = int(round((1 - tau) * pi + tau * pk))
+                        elif isinstance(pop[i][key], float):
+                            pi = float(pop[i][key]); pk = float(pop[k][key])
+                            pop[i][key] = (1 - tau) * pi + tau * pk
+                        else:
+                            # categorical (activation)
+                            if random.random() < tau:
+                                pop[i][key] = pop[k][key]
+                    fitness[i] = evaluate(pop[i])
+                    trials[i] = 0
+                else:
+                    trials[i] += 1
+
+            # Onlooker phase
+            fit_shift = np.array(fitness) - np.min(fitness) + 1e-6
+            prob = fit_shift / fit_shift.sum()
+            num_onlook = max(1, int(self.cfg.onlooker_frac * self.cfg.pop_size))
+            for _ in range(num_onlook):
+                i = np.random.choice(len(pop), p=prob)
+                key = random.choice(list(pop[i].keys()))
+                if isinstance(pop[i][key], int):
+                    lo, hi = (self.space.batch_size if key == "batch_size"
+                              else self.space.epochs if key == "epochs"
+                              else self.space.mlp_layers if key == "mlp_layers"
+                              else self.space.conv_deconv_layers)
+                    pop[i][key] = int(np.clip(pop[i][key] + random.choice([-1, 1]) * random.randint(1, 8), lo, hi))
+                elif isinstance(pop[i][key], float):
+                    pop[i][key] = float(pop[i][key]) * np.exp(np.random.normal(scale=0.1))
+                else:
+                    # categorical: random swap
+                    if random.random() < 0.5:
+                        pop[i][key] = random.choice(self.space.activation).lower()
+                fitness[i] = evaluate(pop[i])
+
+            # Scout phase
+            for i in range(self.cfg.pop_size):
+                if trials[i] >= self.cfg.scout_patience:
+                    pop[i] = sample_random_key(self.space)
+                    fitness[i] = evaluate(pop[i])
+                    trials[i] = 0
+
+        best_idx = int(np.argmax(fitness))
+        return pop[best_idx]
+
+
+def build_system(
+    num_classes: int,
+    device: torch.device,
+    al_cfg: Optional[ALConfig] = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+) -> ActiveLearningSystem:
+    """Factory to build a system with optional overrides from HPO config."""
+    al_cfg = al_cfg or ALConfig()
+    ppo_cfg = PPOConfig()
+    gan_cfg = GANConfig()
+    # Apply overrides if any
+    if cfg_overrides:
+        # AL
+        if "batch_size" in cfg_overrides:
+            al_cfg.batch_size = int(cfg_overrides["batch_size"])  # type: ignore
+        if "p_retain" in cfg_overrides:
+            al_cfg.p_retain_aug = float(cfg_overrides["p_retain"])  # type: ignore
+        # PPO/SLF
+        if "ppo_clip" in cfg_overrides:
+            ppo_cfg.clip_eps = float(cfg_overrides["ppo_clip"])  # type: ignore
+        if "slf_alpha" in cfg_overrides:
+            ppo_cfg.scope_alpha = float(cfg_overrides["slf_alpha"])  # type: ignore
+        if "slf_gamma" in cfg_overrides:
+            ppo_cfg.scope_gamma = float(cfg_overrides["slf_gamma"])  # type: ignore
+        if "mlp_layers" in cfg_overrides:
+            ppo_cfg.mlp_layers = int(cfg_overrides["mlp_layers"])  # type: ignore
+        # GAN
+        if "z_dim" in cfg_overrides:
+            gan_cfg.z_dim = int(cfg_overrides["z_dim"])  # type: ignore
+        if "deconv_layers" in cfg_overrides:
+            gan_cfg.g_layers = int(cfg_overrides["deconv_layers"])  # type: ignore
+        if "conv_layers" in cfg_overrides:
+            gan_cfg.d_layers = int(cfg_overrides["conv_layers"])  # type: ignore
+        if "recon_w" in cfg_overrides:
+            gan_cfg.recon_w = float(cfg_overrides["recon_w"])  # type: ignore
+    # Build the system (activation/dropout/branch depth from overrides)
+    activation = cfg_overrides.get("activation", "relu") if cfg_overrides else "relu"
+    dropout = float(cfg_overrides.get("dropout", 0.3)) if cfg_overrides else 0.3
+    branch_layers = int(cfg_overrides.get("conv_layers", 5)) if cfg_overrides else 5
+    mlp_layers = int(cfg_overrides.get("mlp_layers", 1)) if cfg_overrides else 1
+
+    sys = ActiveLearningSystem(
+        num_classes=num_classes,
+        device=device,
+        al_cfg=al_cfg,
+        ppo_cfg=ppo_cfg,
+        gan_cfg=gan_cfg,
+        num_branches=3,
+        branch_layers=branch_layers,
+        activation=activation,
+        mlp_layers=mlp_layers,
+        dropout=dropout,
+    )
+
+    # Apply learning rates if provided
+    if cfg_overrides:
+        for g in sys.opt_cls.param_groups:
+            g["lr"] = float(cfg_overrides.get("lr_cls", g["lr"]))
+        sys.gan.optG.param_groups[0]["lr"] = float(cfg_overrides.get("lr_g", sys.gan.optG.param_groups[0]["lr"]))
+        sys.gan.optD.param_groups[0]["lr"] = float(cfg_overrides.get("lr_d", sys.gan.optD.param_groups[0]["lr"]))
+
+    return sys
+
+
+# Fitness / evaluation ---------------------------------------------------------
+
+def fitness_eval(config: Dict[str, Any], labeled: Dataset, unlabeled: Dataset, device: torch.device) -> float:
+    """Lightweight fitness: run a tiny AL round and return validation proxy (acc − λ×labels)."""
+    sys = build_system(num_classes=2, device=device, cfg_overrides=config)
+    used, _ = sys.active_round(unlabeled, labeled, steps=48, label_budget=8, train_epochs=int(config.get("epochs", 8)))
+    sys.classifier.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in DataLoader(labeled, batch_size=64):
+            x, y = x.to(sys.device), y.to(sys.device)
+            logits, _ = sys.classifier(x)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += y.numel()
+    acc = correct / max(1, total)
+    score = acc - 0.001 * used
+    return float(score)
+
+
+def ml_abc_optimize(
+    labeled: Dataset,
+    unlabeled: Dataset,
+    space: HPSpace = HPSpace(),
+    cfg: MLABCConfig = MLABCConfig(),
+    seed: int = 42,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """Run ML-ABC over the Table 1 search space; return the best-found configuration."""
+    seed_everything(seed)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    solver = MLABCSolver(space, cfg)
+    def _evaluate(conf: Dict[str, Any]) -> float:
+        # Build tiny synthetic sets for relative fitness during HPO
+        labeled_s, unlabeled_s = tiny_synthetic_dataset(n_per_class=40)
+        return fitness_eval(conf, labeled_s, unlabeled_s, device)
+    best = solver.optimize(_evaluate)
+    return best
+
+
+# ==========================================================
+# Demo data & entrypoints
+# ==========================================================
+
+def tiny_synthetic_dataset(n_per_class: int = 60) -> Tuple[Dataset, Dataset]:
+    """Creates a tiny synthetic dataset with two classes to exercise the pipeline."""
+    class Toy(Dataset):
+        def __init__(self, n: int, cls: int):
+            self.n = n
+            self.cls = cls
+            self.tf = MRITransform()
+        def __len__(self):
+            return self.n
+        def __getitem__(self, idx):
+            rng = np.random.default_rng(seed=idx + self.cls * 1000)
+            img = rng.normal(loc=0.5 + 0.2 * self.cls, scale=0.15, size=(224, 224)).astype(np.float32)
+            img = np.clip(img, 0, 1)
+            img = (img * 255).astype(np.uint8)
+            x = self.tf(img)
+            y = self.cls
+            return x, y
+    ds0 = Toy(n_per_class, 0)
+    ds1 = Toy(n_per_class, 1)
+    class Concat(Dataset):
+        def __init__(self, a: Dataset, b: Dataset):
+            self.a, self.b = a, b
+            self.items = [(i, 0) for i in range(len(a))] + [(i, 1) for i in range(len(b))]
+        def __len__(self):
+            return len(self.items)
+        def __getitem__(self, idx):
+            i, c = self.items[idx]
+            return (self.a if c == 0 else self.b)[i]
+    full = Concat(ds0, ds1)
+    n_labeled = 10
+    labeled_idx = random.sample(range(len(full)), n_labeled)
+    unlabeled_idx = [i for i in range(len(full)) if i not in labeled_idx]
+    class Sub(Dataset):
+        def __init__(self, base: Concat, idxs: List[int]):
+            self.base = base
+            self.items = []
+            for i in idxs:
+                x, y = base[i]
+                path = f"mem://{i}"
+                self.items.append((path, y))
+                _MEM[path] = (x, y)
+        def __len__(self):
+            return len(self.items)
+        def __getitem__(self, idx):
+            path, y = self.items[idx]
+            x, y_true = _MEM[path]
+            return x, y_true
+    return Sub(full, labeled_idx), Sub(full, unlabeled_idx)
+
+
+_MEM: Dict[str, Tuple[torch.Tensor, int]] = {}
+
+
+def run_demo() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(13)
+    labeled, unlabeled = tiny_synthetic_dataset()
+
+    print("[DEMO] Running 3 AL rounds ...")
+    budget_total = 0
+    # Example overrides to show configurability
+    overrides = {
+        "activation": "relu",
+        "conv_layers": 4,
+        "deconv_layers": 4,
+        "mlp_layers": 2,
+        "dropout": 0.25,
+        "z_dim": 96,
+        "p_retain": 0.6,
+        "ppo_clip": 0.2,
+        "slf_alpha": 0.5,
+        "slf_gamma": 0.5,
+        "lr_cls": 1e-3,
+        "lr_g": 3e-3,
+        "lr_d": 2e-3,
+        "batch_size": 32,
+    }
+    system = build_system(num_classes=2, device=device, cfg_overrides=overrides)
+
+    for r in range(3):
+        used, losses = system.active_round(
+            unlabeled=unlabeled,
+            labeled=labeled,
+            steps=64,
+            label_budget=12,
+            train_epochs=8,
+        )
+        budget_total += used
+        print(f"  Round {r+1}: labels used={used}, PPO loss={losses}")
+
+    print("[DEMO] Validating on labeled set...")
+    system.classifier.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in DataLoader(labeled, batch_size=64):
+            x, y = x.to(system.device), y.to(system.device)
+            logits, _ = system.classifier(x)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += y.numel()
+    print(f"  Accuracy on labeled set: {correct / max(1, total):.3f}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Stroke Active Learning Pipeline (Revised)")
+    parser.add_argument("--demo", action="store_true", help="Run a tiny synthetic demo")
+    parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root (folder per class)")
+    parser.add_argument("--dataset", type=str, default="BMRID", choices=["ISLES", "BMRID"], help="Dataset alias")
+    parser.add_argument("--hpo", action="store_true", help="Run ML-ABC hyperparameter search (Table 1 space)")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(42)
+
+    if args.demo or args.data_root is None:
+        labeled, unlabeled = tiny_synthetic_dataset()
+        if args.hpo:
+            best = ml_abc_optimize(labeled, unlabeled, device=device)
+            print("[HPO] Best config:", json.dumps(best, indent=2))
+        run_demo()
+    else:
+        transform = MRITransform()
+        ds = SimpleFolderMRIDataset(args.data_root, transform=transform)
+        idxs = list(range(len(ds)))
+        random.shuffle(idxs)
+        n_labeled = max(10, len(ds) // 50)
+        labeled_idx = idxs[:n_labeled]
+        unlabeled_idx = idxs[n_labeled:]
+        class Sub(Dataset):
+            def __init__(self, base: SimpleFolderMRIDataset, idxs: List[int]):
+                self.base = base
+                self.items = [base.items[i] for i in idxs]
+            def __len__(self):
+                return len(self.items)
+            def __getitem__(self, idx):
+                path, y = self.items[idx]
+                if path.endswith(".npy"):
+                    img = np.load(path)
+                elif path.endswith(".pt"):
+                    img = torch.load(path).numpy()
+                else:
+                    from PIL import Image
+                    img = np.array(Image.open(path).convert("L"))
+                x = transform(img)
+                return x, y
+        labeled_ds = Sub(ds, labeled_idx)
+        unlabeled_ds = Sub(ds, unlabeled_idx)
+
+        # Run ML-ABC if requested, else default system
+        if args.hpo:
+            best = ml_abc_optimize(labeled_ds, unlabeled_ds, device=device)
+            print("[HPO] Best config:", json.dumps(best, indent=2))
+            system = build_system(num_classes=len(ds.class_to_idx), device=device, cfg_overrides=best)
+        else:
+            system = build_system(num_classes=len(ds.class_to_idx), device=device)
+
+        rounds = 5
+        total_budget = len(unlabeled_ds) // 10
+        per_round = max(1, total_budget // rounds)
+        for r in range(rounds):
+            used, losses = system.active_round(
+                unlabeled=unlabeled_ds,
+                labeled=labeled_ds,
+                steps=200,
+                label_budget=per_round,
+                train_epochs=8,
+            )
+            print(f"[Round {r+1}] labels used={used} losses={losses}")
+
+        print("Training complete.")
+"""
+Stroke Active Learning Pipeline (paper-inspired, revised per user requests)
+
+Modules:
+  - data: ISLES/BMRID loaders + preprocessing (resize → [0,1] → z-score → Gaussian smoothing → optional histogram equalization → slice alignment & orientation normalization)
+  - gan: Online augmentation GAN with selective gradient omission (configurable num layers)
+  - model: Multi-branch CNN classifier (configurable activation, dropout, #conv layers)
+  - rl: PPO agent with Scope Loss (SLF) for AL sample selection (configurable MLP depth)
+  - al_loop: End-to-end active learning cycle integrating classifier, RL agent, and GAN
+  - hpo: Random-Key + Mutual-Learning Artificial Bee Colony (ML-ABC) hyperparameter optimizer
+
+Environment settings (requested):
+  The study was conducted on a 64-bit version of Windows 10. A high-performance computing environment was used to meet the computational demands of deep learning algorithms. Model development and training were performed in Python version 3.10, using TensorFlow version 2.12 and Keras version 2.12 to build and implement CNNs and FC layers. DRL components were implemented using PyTorch version 2.1, which enables the flexible design of custom reinforcement learning algorithms. The hardware setup consisted of a server equipped with two NVIDIA GeForce RTX 3080 GPUs (10GB VRAM each). Approximately 128 GB of system RAM was available. This setup allowed efficient handling of large datasets and complex models, reducing training time and ensuring stable performance during experiments.
+
+Table 1 — Space of hyperparameters used for the proposed model (implemented in HPO):
+  • Batch size: [16–512]
+  • Learning rate: [0–1]
+  • Epoch: [8–128]
+  • Activation function: {ReLU, Tanh, Sigmoid}
+  • Dropout rate: [0–1]
+  • Reconstruction weight (λ): [0–1]
+  • Noise size (z_dim): [16–512]
+  • Retention probability (p_k): [0–1]
+  • Number of layers in MLP: [1–8]
+  • Number of conv/deconv layers: [2–10]
+  • PPO clip threshold (ε): [0.1–0.3]
+  • SLF curvature (γ): [0–1]
+  • SLF certainty modulator (α): [0.01–1]
+
+Notes:
+  • Code defaults are conservative; HPO widens ranges to the full Table 1.
+  • Comments and docstrings are in English as requested.
+  • Heavy training is parameterized; defaults run a tiny demo if invoked with --demo.
+
+Author: Python Assistant
+"""
+from __future__ import annotations
+
+import os
+import math
+import random
+import time
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+
+# ==========================================================
+# utils
+# ==========================================================
+
+def seed_everything(seed: int = 42) -> None:
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def to_device(batch: Any, device: torch.device) -> Any:
+    """Recursively moves tensors in a nested structure to device."""
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(to_device(x, device) for x in batch)
+    if isinstance(batch, dict):
+        return {k: to_device(v, device) for k, v in batch.items()}
+    return batch
+
+
+# ==========================================================
+# data: ISLES / BMRID loaders
+# ==========================================================
+
+class MRITransform:
+    """Preprocessing pipeline for MRI slices.
+
+    Steps (as requested):
+      1) Resize to 224×224 (CNN input compatibility)
+      2) Scale pixel values to [0, 1] (training stability)
+      3) Z-score standardization per-scan (scanner/protocol normalization)
+      4) Gaussian smoothing for noise reduction
+      5) Optional histogram equalization for low-contrast scans
+      6) Slice alignment and orientation normalization (consistency of anatomy)
+
+    Notes:
+      • Alignment is implemented via intensity centroiding to center anatomy; orientation is normalized
+        with a simple heuristic (left-right intensity profile) or forced via parameters.
+      • For production-grade MRI orientation handling, consider reading acquisition headers
+        (e.g., nibabel + orientation codes). Here we implement a robust heuristic without extra deps.
+    """
+
+    def __init__(
+        self,
+        apply_blur: bool = True,
+        apply_eq: bool = False,
+        image_size: int = 224,
+        normalize_orientation: bool = True,
+        align_slices: bool = True,
+        force_flip_lr: Optional[bool] = None,
+    ):
+        self.apply_blur = apply_blur
+        self.apply_eq = apply_eq
+        self.image_size = image_size
+        self.normalize_orientation = normalize_orientation
+        self.align_slices = align_slices
+        self.force_flip_lr = force_flip_lr  # if True/False forces LR flip/keep; None → auto
+        ops = [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),  # converts to [0,1]
+        ]
+        self.base = transforms.Compose(ops)
+        self.blur = transforms.GaussianBlur(kernel_size=3) if apply_blur else None
+
+    def __call__(self, img: np.ndarray) -> torch.Tensor:
+        # Accept HxW or HxWxC (uint8 or float)
+        if img.ndim == 2:
+            img = np.expand_dims(img, -1)
+        if img.shape[2] == 1:  # grayscale → 3ch
+            img = np.repeat(img, 3, axis=2)
+        img = img.astype(np.float32)
+        if img.max() > 1.5:
+            img = img / 255.0
+        ten = self.base(img)  # [C,H,W] in [0,1]
+        if self.blur is not None:
+            ten = self.blur(ten)
+        if self.apply_eq:
+            ten = torch.stack([_rank_equalize(ten[c]) for c in range(ten.shape[0])], dim=0)
+        # z-score per image (per-scan approximation for 2D slice)
+        mean = ten.mean()
+        std = ten.std().clamp_min(1e-6)
+        ten = (ten - mean) / std
+        # Alignment (center-of-mass to center of frame)
+        if self.align_slices:
+            ten = _center_align_tensor(ten)
+        # Orientation normalization (left-right)
+        if self.normalize_orientation:
+            ten = _normalize_left_right(ten, force_flip_lr=self.force_flip_lr)
+        return ten
+
+
+def _rank_equalize(channel: torch.Tensor) -> torch.Tensor:
+    """Approx. histogram equalization via per-image rank mapping."""
+    flat = channel.flatten()
+    ranks = flat.argsort().argsort().float() / (flat.numel() - 1)
+    return ranks.view_as(channel)
+
+
+def _center_align_tensor(x: torch.Tensor) -> torch.Tensor:
+    """Shift the image so intensity centroid is near the spatial center.
+
+    Implementation is translation-only using integer pixel shifts (torch.roll), channel-wise preserved.
+    """
+    with torch.no_grad():
+        c, h, w = x.shape
+        # Compute weights from positive intensities (avoid negatives after z-score)
+        xx = x.clamp_min(0)
+        grid_y = torch.arange(h, device=x.device).float()
+        grid_x = torch.arange(w, device=x.device).float()
+        Y, X = torch.meshgrid(grid_y, grid_x, indexing='ij')
+        # average over channels
+        weights = xx.mean(0)
+        total = weights.sum().clamp_min(1e-6)
+        cy = (Y * weights).sum() / total
+        cx = (X * weights).sum() / total
+        shift_y = int(round(h / 2 - cy.item()))
+        shift_x = int(round(w / 2 - cx.item()))
+        x = torch.roll(x, shifts=(shift_y, shift_x), dims=(1, 2))
+        return x
+
+
+def _normalize_left_right(x: torch.Tensor, force_flip_lr: Optional[bool] = None) -> torch.Tensor:
+    """Normalize left-right orientation.
+
+    Heuristic: compare mean intensity of left vs right halves (after smoothing). If forced, obey flag.
+    """
+    if force_flip_lr is True:
+        return torch.flip(x, dims=[2])
+    if force_flip_lr is False:
+        return x
+    # auto
+    with torch.no_grad():
+        c, h, w = x.shape
+        left = x[:, :, : w // 2].abs().mean()
+        right = x[:, :, w // 2 :].abs().mean()
+        # flip if right>left to enforce a canonical convention (left-half brighter)
+        if right > left:
+            x = torch.flip(x, dims=[2])
+        return x
+
+
+class SimpleFolderMRIDataset(Dataset):
+    """Generic folder dataset.
+
+    Expected structure:
+      root/
+        class_0/
+          img_*.npy | .pt | .png | .jpg
+        class_1/
+          ...
+    For MRI volumes, provide pre-extracted 2D slices as images or .npy arrays.
+    """
+
+    def __init__(self, root: str, transform: Optional[Callable[[np.ndarray], torch.Tensor]] = None):
+        super().__init__()
+        self.root = root
+        self.transform = transform or MRITransform()
+        self.items: List[Tuple[str, int]] = []
+        classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        for c in classes:
+            cdir = os.path.join(root, c)
+            for fname in os.listdir(cdir):
+                if any(fname.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".npy", ".pt")):
+                    self.items.append((os.path.join(cdir, fname), self.class_to_idx[c]))
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        path, label = self.items[idx]
+        if path.endswith(".npy"):
+            img = np.load(path)
+        elif path.endswith(".pt"):
+            img = torch.load(path).numpy()
+        else:
+            from PIL import Image
+            img = np.array(Image.open(path).convert("L"))
+        x = self.transform(img)
+        y = label
+        return x, y
+
+
+ISLESDataset = SimpleFolderMRIDataset
+BMRIDDataset = SimpleFolderMRIDataset
+
+
+# ==========================================================
+# GAN for online augmentation w/ selective gradient omission
+# ==========================================================
+
+class FlexibleDisc(nn.Module):
+    """Configurable discriminator returning features and real/fake logits.
+
+    conv_layers: number of conv blocks (2–10). Each block: Conv3×3(stride 1 or 2) → BN → LeakyReLU.
+    Stride pattern doubles resolution reduction every other block.
+    """
+
+    def __init__(self, in_ch: int = 3, base: int = 64, conv_layers: int = 3, image_size: int = 224):
+        super().__init__()
+        convs, bns = [], []
+        c_in = in_ch
+        c = base
+        for i in range(conv_layers):
+            stride = 2 if i > 0 else 1
+            convs.append(nn.Conv2d(c_in, c, 3, stride=stride, padding=1))
+            bns.append(nn.BatchNorm2d(c))
+            c_in = c
+            c = min(c * 2, base * 8)
+        self.convs = nn.ModuleList(convs)
+        self.bns = nn.ModuleList(bns)
+        # compute flatten size
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, image_size, image_size)
+            h = dummy
+            for i in range(conv_layers):
+                h = F.leaky_relu(self.bns[i](self.convs[i](h)), negative_slope=0.2)
+            feat_dim = h.view(1, -1).size(1)
+        self.head = nn.Linear(feat_dim, 1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = x
+        for conv, bn in zip(self.convs, self.bns):
+            h = F.leaky_relu(bn(conv(h)), negative_slope=0.2)
+        feat = h.view(h.size(0), -1)
+        logit = self.head(feat)
+        return feat, logit
+
+
+class FlexibleGen(nn.Module):
+    """Configurable deconvolutional generator.
+
+    deconv_layers: number of deconv blocks (2–10): [ConvT → BN → ReLU]* (final Tanh).
+    """
+
+    def __init__(self, z_dim: int = 100, feat_dim: int = 56 * 56 * 256, out_ch: int = 3, base: int = 64, deconv_layers: int = 4):
+        super().__init__()
+        self.feat_proj = nn.Linear(feat_dim, z_dim)
+        # Start from a small spatial seed
+        self.seed_hw = 14
+        self.fc = nn.Linear(z_dim, base * 8 * self.seed_hw * self.seed_hw)
+        # Build deconvs
+        chans = [base * 8]
+        for i in range(deconv_layers - 1):
+            chans.append(max(base, chans[-1] // 2))
+        self.deconvs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        for i in range(deconv_layers - 1):
+            self.deconvs.append(nn.ConvTranspose2d(chans[i], chans[i + 1], 4, stride=2, padding=1))
+            self.bns.append(nn.BatchNorm2d(chans[i + 1]))
+        self.final = nn.ConvTranspose2d(chans[-1], out_ch, 4, stride=2, padding=1)
+
+    def forward(self, z: torch.Tensor, cond_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if cond_feat is not None:
+            z = z + self.feat_proj(cond_feat)
+        h = self.fc(z).view(z.size(0), -1, self.seed_hw, self.seed_hw)
+        for deconv, bn in zip(self.deconvs, self.bns):
+            h = F.relu(bn(deconv(h)))
+        x = torch.tanh(self.final(h))
+        return x
+
+
+@dataclass
+class GANConfig:
+    z_dim: int = 100
+    topk_frac: float = 0.2  # fraction of strongest D responses to omit for G update
+    lr_g: float = 6e-3
+    lr_d: float = 2e-3
+    recon_w: float = 0.3  # optional L1 towards real sample
+    d_layers: int = 3
+    g_layers: int = 4
+
+
+class OnlineAugGAN:
+    """GAN wrapper implementing online augmentation with selective gradient omission.
+
+    Usage:
+        gan = OnlineAugGAN(device)
+        batch = gan.maybe_augment(real_batch, labels, p_retain=0.6)
+    """
+
+    def __init__(self, device: torch.device, cfg: GANConfig = GANConfig(), image_size: int = 224):
+        self.device = device
+        self.cfg = cfg
+        self.D = FlexibleDisc(conv_layers=cfg.d_layers, image_size=image_size).to(device)
+        # temporary forward to infer feat_dim for generator
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, image_size, image_size).to(device)
+            feat_dim, _ = self.D(dummy)
+        self.G = FlexibleGen(z_dim=cfg.z_dim, feat_dim=feat_dim.size(1), deconv_layers=cfg.g_layers).to(device)
+        self.optD = torch.optim.Adam(self.D.parameters(), lr=cfg.lr_d, betas=(0.5, 0.999))
+        self.optG = torch.optim.Adam(self.G.parameters(), lr=cfg.lr_g, betas=(0.5, 0.999))
+
+    @torch.no_grad()
+    def _disc_feat(self, x: torch.Tensor) -> torch.Tensor:
+        feat, _ = self.D(x)
+        return feat
+
+    def train_step(self, real: torch.Tensor) -> None:
+        """One adversarial step with selective omission on generator update."""
+        b = real.size(0)
+        z = torch.randn(b, self.cfg.z_dim, device=self.device)
+
+        # ---------------- D step ----------------
+        self.optD.zero_grad()
+        feat_r, logit_r = self.D(real)
+        fake = self.G(z, feat_r.detach())
+        feat_f, logit_f = self.D(fake.detach())
+        loss_d = F.softplus(-logit_r).mean() + F.softplus(logit_f).mean()
+        loss_d.backward()
+        self.optD.step()
+
+        # ---------------- G step with selective omission ----------------
+        self.optG.zero_grad()
+        feat_r, _ = self.D(real)
+        fake = self.G(z, feat_r.detach())
+        _, logit_f2 = self.D(fake)
+        k = max(1, int(self.cfg.topk_frac * b))
+        scores = logit_f2.detach().view(-1)
+        topk_idx = torch.topk(scores, k=k, largest=True).indices
+        weight = torch.ones_like(scores)
+        weight[topk_idx] = 0.0
+        loss_vec = F.softplus(-logit_f2.view(-1))
+        recon = self.cfg.recon_w * (fake - real[torch.randperm(b, device=self.device)]).abs().mean(dim=(1, 2, 3))
+        loss_g = ((loss_vec + recon) * weight).sum() / weight.clamp_min(1e-6).sum()
+        loss_g.backward()
+        self.optG.step()
+
+    def maybe_augment(self, batch_x: torch.Tensor, labels: torch.Tensor, p_retain: float = 0.6) -> torch.Tensor:
+        """Online augmentation inside a mini-batch: with prob (1 - p_retain) replace with G(z|feat)."""
+        self.train_step(batch_x)
+        with torch.no_grad():
+            b = batch_x.size(0)
+            feat = self._disc_feat(batch_x)
+            z = torch.randn(b, self.cfg.z_dim, device=self.device)
+            gen = self.G(z, feat)
+            mask = (torch.rand(b, device=self.device) > p_retain).float().view(-1, 1, 1, 1)
+            aug = batch_x * (1 - mask) + gen * mask
+        return aug
+
+
+# ==========================================================
+# Classifier: multi-branch CNN per paper (configurable)
+# ==========================================================
+
+_ACTIVATIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "relu": F.relu,
+    "tanh": torch.tanh,
+    "sigmoid": torch.sigmoid,
+}
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, act: str = "relu", p_drop: float = 0.0):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.pool = nn.MaxPool2d(2)
+        self.act = act
+        self.dropout = nn.Dropout2d(p=p_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = _ACTIVATIONS[self.act](self.bn(self.conv(x)))
+        h = self.pool(h)
+        h = self.dropout(h)
+        return h
+
+
+class BranchCNN(nn.Module):
+    """CNN branch with configurable number of layers (2–10) and activation."""
+
+    def __init__(self, in_ch: int = 3, layers: int = 5, base: int = 128, act: str = "relu", p_drop: float = 0.0):
+        super().__init__()
+        chans: List[int] = [max(base // (2 ** i), 8) for i in range(layers)]
+        blocks: List[nn.Module] = []
+        c_in = in_ch
+        for c in chans:
+            blocks.append(ConvBlock(c_in, c, act=act, p_drop=p_drop))
+            c_in = c
+        self.net = nn.Sequential(*blocks)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        return torch.flatten(h, 1)
+
+
+class MultiBranchClassifier(nn.Module):
+    """Multiple CNN branches, concatenated features → MLP head. Configurable activation & depth."""
+
+    def __init__(
+        self,
+        num_classes: int = 2,
+        in_ch: int = 3,
+        num_branches: int = 3,
+        branch_layers: int = 5,
+        act: str = "relu",
+        mlp_layers: int = 1,
+        feat_dim: int = 256,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.branches = nn.ModuleList([
+            BranchCNN(in_ch, layers=branch_layers, act=act, p_drop=dropout) for _ in range(num_branches)
+        ])
+        # Infer flatten size with a dummy forward
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, 224, 224)
+            fsz = self.branches[0](dummy).numel()
+        # Build MLP head with configurable depth
+        mlp: List[nn.Module] = [nn.Linear(num_branches * fsz, feat_dim), nn.Dropout(dropout)]
+        for _ in range(max(0, mlp_layers - 1)):
+            mlp += [nn.Linear(feat_dim, feat_dim), nn.ReLU(), nn.Dropout(dropout)]
+        mlp += [nn.Linear(feat_dim, num_classes)]
+        self.fc = nn.Sequential(*mlp)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feats = [b(x) for b in self.branches]
+        fcat = torch.cat(feats, dim=1)
+        logits = self.fc(fcat)
+        return logits, fcat
+
+
+# ==========================================================
+# RL with Scope Loss (PPO-style) for Active Learning
+# ==========================================================
+
+@dataclass
+class PPOConfig:
+    gamma: float = 0.99
+    lam: float = 0.95
+    clip_eps: float = 0.2
+    lr: float = 1e-3
+    entropy_coef: float = 0.01
+    scope_alpha: float = 0.5  # certainty modulator α
+    scope_gamma: float = 0.5  # curvature control γ (0–1 per Table 1)
+    train_iters: int = 4
+    batch_size: int = 64
+    mlp_layers: int = 1
+
+
+class PolicyNet(nn.Module):
+    """Small configurable MLP policy over state → action (2) and value."""
+
+    def __init__(self, state_dim: int, hidden: int = 256, mlp_layers: int = 1):
+        super().__init__()
+        layers: List[nn.Module] = [nn.Linear(state_dim, hidden), nn.ReLU()]
+        for _ in range(max(0, mlp_layers - 1)):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU()]
+        self.pi = nn.Sequential(*layers, nn.Linear(hidden, 2))
+        self.v = nn.Sequential(*layers, nn.Linear(hidden, 1))
+
+    def forward(self, s: torch.Tensor) -> Tuple[torch.distributions.Categorical, torch.Tensor]:
+        logits = self.pi(s)
+        dist = torch.distributions.Categorical(logits=logits)
+        v = self.v(s).squeeze(-1)
+        return dist, v
+
+
+class TrajBuffer:
+    def __init__(self):
+        self.s = []
+        self.a = []
+        self.logp = []
+        self.r = []
+        self.v = []
+        self.done = []
+
+    def add(self, s, a, logp, r, v, d):
+        self.s.append(s)
+        self.a.append(a)
+        self.logp.append(logp)
+        self.r.append(r)
+        self.v.append(v)
+        self.done.append(d)
+
+    def get(self):
+        return (
+            torch.stack(self.s),
+            torch.tensor(self.a, dtype=torch.long),
+            torch.stack(self.logp),
+            torch.tensor(self.r, dtype=torch.float32),
+            torch.stack(self.v),
+            torch.tensor(self.done, dtype=torch.float32),
+        )
+
+
+def compute_gae(r, v, done, gamma: float, lam: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generalized Advantage Estimation (vectorized over trajectory)."""
+    T = r.size(0)
+    adv = torch.zeros_like(r)
+    lastgaelam = 0.0
+    for t in reversed(range(T)):
+        nextv = v[t + 1] if t + 1 < T else 0.0
+        nonterminal = 1.0 - done[t]
+        delta = r[t] + gamma * nextv * nonterminal - v[t]
+        lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        adv[t] = lastgaelam
+    ret = adv + v
+    return adv, ret
+
+
+def scope_scale(prob: torch.Tensor, adv: torch.Tensor, alpha: float, gamma_f: float) -> torch.Tensor:
+    """Scope Loss scaling factor.
+
+    Normalize advantages with z-score, then: scope = (1 - prob)^γ * (α + |adv_z|).
+    """
+    adv_z = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+    scope = torch.pow(1.0 - prob.detach().clamp(1e-6, 1.0), gamma_f) * (alpha + adv_z.abs())
+    return scope.detach()
+
+
+class PPOWithScope:
+    def __init__(self, state_dim: int, cfg: PPOConfig, device: torch.device):
+        self.cfg = cfg
+        self.device = device
+        self.net = PolicyNet(state_dim, mlp_layers=cfg.mlp_layers).to(device)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
+
+    def update(self, buf: TrajBuffer) -> Dict[str, float]:
+        s, a, logp_old, r, v, done = buf.get()
+        s, a, logp_old, r, v, done = (
+            s.to(self.device),
+            a.to(self.device),
+            logp_old.to(self.device),
+            r.to(self.device),
+            v.to(self.device),
+            done.to(self.device),
+        )
+        adv, ret = compute_gae(r, v, done, self.cfg.gamma, self.cfg.lam)
+        adv = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+
+        n = s.size(0)
+        idx = torch.randperm(n)
+        losses = {}
+        for _ in range(self.cfg.train_iters):
+            for start in range(0, n, self.cfg.batch_size):
+                end = min(n, start + self.cfg.batch_size)
+                mb = idx[start:end]
+                dist, v_pred = self.net(s[mb])
+                logp = dist.log_prob(a[mb])
+                ratio = torch.exp(logp - logp_old[mb])
+                prob_a = torch.exp(dist.logits.gather(1, a[mb].unsqueeze(1)).squeeze(1) - dist.logits.logsumexp(1))
+                scope = scope_scale(prob_a, adv[mb], self.cfg.scope_alpha, self.cfg.scope_gamma)
+                pg_unclipped = -ratio * adv[mb] * scope
+                pg_clipped = -torch.clamp(ratio, 1.0 - self.cfg.clip_eps, 1.0 + self.cfg.clip_eps) * adv[mb] * scope
+                pg_loss = torch.max(pg_unclipped, pg_clipped).mean()
+                v_loss = F.mse_loss(v_pred, ret[mb])
+                ent = dist.entropy().mean()
+                loss = pg_loss + 0.5 * v_loss - self.cfg.entropy_coef * ent
+                self.opt.zero_grad()
+                loss.backward()
+                self.opt.step()
+                losses = {
+                    "pg": float(pg_loss.item()),
+                    "v": float(v_loss.item()),
+                    "ent": float(ent.item()),
+                }
+        return losses
+
+
+# ==========================================================
+# Active Learning Loop
+# ==========================================================
+
+@dataclass
+class ALConfig:
+    label_budget: int = 200
+    batch_size: int = 32
+    epochs_per_round: int = 1
+    rl_steps_per_round: int = 200
+    not_label_penalty: float = 0.0
+    label_penalty: float = -0.05  # small negative reward to discourage over-labeling
+    p_retain_aug: float = 0.6
+
+
+class ActiveLearningSystem:
+    """End-to-end active learning system tying everything together."""
+
+    def __init__(
+        self,
+        num_classes: int,
+        device: torch.device,
+        al_cfg: ALConfig,
+        ppo_cfg: PPOConfig,
+        gan_cfg: GANConfig,
+        num_branches: int = 3,
+        branch_layers: int = 5,
+        activation: str = "relu",
+        mlp_layers: int = 1,
+        dropout: float = 0.3,
+    ):
+        self.device = device
+        self.al_cfg = al_cfg
+        self.classifier = MultiBranchClassifier(
+            num_classes=num_classes,
+            num_branches=num_branches,
+            branch_layers=branch_layers,
+            act=activation,
+            mlp_layers=mlp_layers,
+            dropout=dropout,
+        ).to(device)
+        self.opt_cls = torch.optim.Adam(self.classifier.parameters(), lr=1e-3)
+        # RL state will be: [feat_vector || softmax_probs]
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 224, 224).to(device)
+            _, f = self.classifier(dummy)
+            state_dim = f.size(1) + num_classes
+        ppo_cfg.mlp_layers = mlp_layers
+        self.agent = PPOWithScope(state_dim, ppo_cfg, device)
+        self.gan = OnlineAugGAN(device, gan_cfg)
+        self.num_classes = num_classes
+
+    def _class_centers(self, loader: DataLoader) -> torch.Tensor:
+        """Compute feature means per class from labeled data for entropy reward."""
+        sums = [torch.zeros(0, device=self.device)] * self.num_classes
+        cnt = [0] * self.num_classes
+        self.classifier.eval()
+        with torch.no_grad():
+            for x, y in loader:
+                x = x.to(self.device)
+                y = y.to(self.device)
+                _, f = self.classifier(x)
+                for c in range(self.num_classes):
+                    mask = (y == c)
+                    if mask.any():
+                        fs = f[mask]
+                        if cnt[c] == 0:
+                            sums[c] = fs.sum(dim=0)
+                        else:
+                            sums[c] = sums[c] + fs.sum(dim=0)
+                        cnt[c] += int(mask.sum().item())
+        centers = []
+        for c in range(self.num_classes):
+            if cnt[c] == 0:
+                centers.append(torch.zeros_like(sums[0]))
+            else:
+                centers.append(sums[c] / cnt[c])
+        return torch.stack(centers, dim=0)
+
+    def _entropy_reward(self, feat: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+        """Entropy-like reward using distances to class centers as logits."""
+        d = torch.cdist(feat.unsqueeze(0), centers).squeeze(0)  # [C]
+        logits = -d
+        prob = F.softmax(logits, dim=0)
+        ent = -(prob * (prob.clamp_min(1e-6)).log()).sum()
+        return ent
+
+    def train_classifier(self, loader: DataLoader, epochs: int = 1) -> None:
+        self.classifier.train()
+        for _ in range(epochs):
+            for x, y in loader:
+                x, y = x.to(self.device), y.to(self.device)
+                x = self.gan.maybe_augment(x, y, p_retain=self.al_cfg.p_retain_aug)
+                logits, _ = self.classifier(x)
+                p = F.softmax(logits, dim=1)
+                y_onehot = F.one_hot(y, num_classes=self.num_classes).float()
+                pt = (p * y_onehot).sum(dim=1).clamp(1e-6, 1.0)
+                gamma = 2.0
+                loss = (-(1 - pt) ** gamma * pt.log()).mean()
+                self.opt_cls.zero_grad()
+                loss.backward()
+                self.opt_cls.step()
+
+    def active_round(
+        self,
+        unlabeled: Dataset,
+        labeled: Dataset,
+        steps: int,
+        label_budget: int,
+        train_epochs: int,
+    ) -> Tuple[int, Dict[str, float]]:
+        labeled_loader = DataLoader(labeled, batch_size=self.al_cfg.batch_size, shuffle=True)
+        centers = self._class_centers(labeled_loader)
+
+        buf = TrajBuffer()
+        budget_used = 0
+        self.classifier.eval()
+        for _ in range(steps):
+            idx = random.randrange(len(unlabeled))
+            x_u, _ = unlabeled[idx]
+            x_u = x_u.unsqueeze(0).to(self.device)
+            with torch.no_grad():
+                logits, f = self.classifier(x_u)
+                prob = F.softmax(logits, dim=1)
+                state = torch.cat([f, prob], dim=1).squeeze(0)
+            dist, v = self.agent.net(state.unsqueeze(0))
+            a = dist.sample().item()  # 0: do not label, 1: label
+            logp = dist.log_prob(torch.tensor(a, device=self.device))
+
+            if a == 1 and budget_used < label_budget:
+                x_true, y_true = unlabeled[idx]
+                labeled.items.append((unlabeled.items[idx][0], y_true))
+                unlabeled.items.pop(idx)
+                reward = self.al_cfg.label_penalty
+                budget_used += 1
+            else:
+                with torch.no_grad():
+                    _, f_now = self.classifier(x_u)
+                    reward = float(self._entropy_reward(f_now.squeeze(0), centers))
+                reward += self.al_cfg.not_label_penalty
+
+            buf.add(state, a, logp.detach(), reward, v.detach(), 0.0)
+            if budget_used >= label_budget:
+                break
+
+        losses = self.agent.update(buf)
+        self.train_classifier(DataLoader(labeled, batch_size=self.al_cfg.batch_size, shuffle=True), epochs=train_epochs)
+        return budget_used, losses
+
+
+# ==========================================================
+# Hyperparameter Optimization: Random-Key + ML-ABC
+# ==========================================================
+
+@dataclass
+class HPSpace:
+    # Table 1 ranges
+    batch_size: Tuple[int, int] = (16, 512)
+    lr_min_max: Tuple[float, float] = (1e-5, 1.0)  # log-uniform sample within [~0, 1]
+    epochs: Tuple[int, int] = (8, 128)
+    activation: Tuple[str, ...] = ("ReLU", "Tanh", "Sigmoid")
+    dropout: Tuple[float, float] = (0.0, 1.0)
+    recon_w: Tuple[float, float] = (0.0, 1.0)
+    z_dim: Tuple[int, int] = (16, 512)
+    p_retain: Tuple[float, float] = (0.0, 1.0)
+    mlp_layers: Tuple[int, int] = (1, 8)
+    conv_deconv_layers: Tuple[int, int] = (2, 10)
+    ppo_clip: Tuple[float, float] = (0.1, 0.3)
+    slf_gamma: Tuple[float, float] = (0.0, 1.0)
+    slf_alpha: Tuple[float, float] = (0.01, 1.0)
+
+
+@dataclass
+class MLABCConfig:
+    pop_size: int = 16
+    onlooker_frac: float = 0.5
+    scout_patience: int = 4
+    iters: int = 12
+    reciprocal_lr: float = 0.5  # tau in mutual learning
+
+
+def _rand_between(lo: float, hi: float) -> float:
+    return lo + (hi - lo) * random.random()
+
+
+def _rand_int(lo: int, hi: int) -> int:
+    return random.randint(lo, hi)
+
+
+def _sample_log_uniform(lo: float, hi: float) -> float:
+    lo = max(lo, 1e-8)
+    r = math.log(hi) - math.log(lo)
+    return math.exp(math.log(lo) + random.random() * r)
+
+
+def sample_random_key(space: HPSpace) -> Dict[str, Any]:
+    """Sample one hyperparameter vector using a Random-Key style mapping (Table 1)."""
+    act = random.choice(space.activation)
+    act_l = act.lower()
+    return {
+        "batch_size": _rand_int(*space.batch_size),
+        "lr_cls": _sample_log_uniform(*space.lr_min_max),
+        "lr_g": _sample_log_uniform(*space.lr_min_max),
+        "lr_d": _sample_log_uniform(*space.lr_min_max),
+        "epochs": _rand_int(*space.epochs),
+        "activation": act_l,  # "relu" | "tanh" | "sigmoid"
+        "dropout": _rand_between(*space.dropout),
+        "recon_w": _rand_between(*space.recon_w),
+        "z_dim": _rand_int(*space.z_dim),
+        "p_retain": _rand_between(*space.p_retain),
+        "mlp_layers": _rand_int(*space.mlp_layers),
+        "conv_layers": _rand_int(*space.conv_deconv_layers),  # for classifier branches & D
+        "deconv_layers": _rand_int(*space.conv_deconv_layers), # for G
+        "ppo_clip": _rand_between(*space.ppo_clip),
+        "slf_gamma": _rand_between(*space.slf_gamma),
+        "slf_alpha": _rand_between(*space.slf_alpha),
+    }
+
+
+class MLABCSolver:
+    """Mutual-Learning Artificial Bee Colony (ML-ABC) optimizer.
+
+    Phases per iteration:
+      • Employed-bee: each solution explores a neighbor; if a better peer exists, move toward it (mutual learning with step τ).
+      • Onlooker-bee: select solutions with probability ∝ (fitness − min + ε); apply small perturbations.
+      • Scout-bee: if a solution stagnates for `scout_patience`, reinitialize it randomly.
+
+    Uses a Random-Key parameterization to handle mixed discrete/continuous spaces in Table 1.
+    """
+
+    def __init__(self, space: HPSpace, cfg: MLABCConfig):
+        self.space = space
+        self.cfg = cfg
+
+    def optimize(self, evaluate: Callable[[Dict[str, Any]], float]) -> Dict[str, Any]:
+        pop: List[Dict[str, Any]] = [sample_random_key(self.space) for _ in range(self.cfg.pop_size)]
+        fitness: List[float] = [evaluate(p) for p in pop]
+        trials: List[int] = [0] * self.cfg.pop_size
+
+        for _ in range(self.cfg.iters):
+            # Employed bee + mutual learning
+            for i in range(self.cfg.pop_size):
+                k = random.choice([j for j in range(self.cfg.pop_size) if j != i])
+                if fitness[k] > fitness[i]:
+                    tau = random.random() * self.cfg.reciprocal_lr
+                    for key in pop[i].keys():
+                        if isinstance(pop[i][key], int):
+                            pi = float(pop[i][key]); pk = float(pop[k][key])
+                            pop[i][key] = int(round((1 - tau) * pi + tau * pk))
+                        elif isinstance(pop[i][key], float):
+                            pi = float(pop[i][key]); pk = float(pop[k][key])
+                            pop[i][key] = (1 - tau) * pi + tau * pk
+                        else:
+                            # categorical (activation)
+                            if random.random() < tau:
+                                pop[i][key] = pop[k][key]
+                    fitness[i] = evaluate(pop[i])
+                    trials[i] = 0
+                else:
+                    trials[i] += 1
+
+            # Onlooker phase
+            fit_shift = np.array(fitness) - np.min(fitness) + 1e-6
+            prob = fit_shift / fit_shift.sum()
+            num_onlook = max(1, int(self.cfg.onlooker_frac * self.cfg.pop_size))
+            for _ in range(num_onlook):
+                i = np.random.choice(len(pop), p=prob)
+                key = random.choice(list(pop[i].keys()))
+                if isinstance(pop[i][key], int):
+                    lo, hi = (self.space.batch_size if key == "batch_size"
+                              else self.space.epochs if key == "epochs"
+                              else self.space.mlp_layers if key == "mlp_layers"
+                              else self.space.conv_deconv_layers)
+                    pop[i][key] = int(np.clip(pop[i][key] + random.choice([-1, 1]) * random.randint(1, 8), lo, hi))
+                elif isinstance(pop[i][key], float):
+                    pop[i][key] = float(pop[i][key]) * np.exp(np.random.normal(scale=0.1))
+                else:
+                    # categorical: random swap
+                    if random.random() < 0.5:
+                        pop[i][key] = random.choice(self.space.activation).lower()
+                fitness[i] = evaluate(pop[i])
+
+            # Scout phase
+            for i in range(self.cfg.pop_size):
+                if trials[i] >= self.cfg.scout_patience:
+                    pop[i] = sample_random_key(self.space)
+                    fitness[i] = evaluate(pop[i])
+                    trials[i] = 0
+
+        best_idx = int(np.argmax(fitness))
+        return pop[best_idx]
+
+
+def build_system(
+    num_classes: int,
+    device: torch.device,
+    al_cfg: Optional[ALConfig] = None,
+    cfg_overrides: Optional[Dict[str, Any]] = None,
+) -> ActiveLearningSystem:
+    """Factory to build a system with optional overrides from HPO config."""
+    al_cfg = al_cfg or ALConfig()
+    ppo_cfg = PPOConfig()
+    gan_cfg = GANConfig()
+    # Apply overrides if any
+    if cfg_overrides:
+        # AL
+        if "batch_size" in cfg_overrides:
+            al_cfg.batch_size = int(cfg_overrides["batch_size"])  # type: ignore
+        if "p_retain" in cfg_overrides:
+            al_cfg.p_retain_aug = float(cfg_overrides["p_retain"])  # type: ignore
+        # PPO/SLF
+        if "ppo_clip" in cfg_overrides:
+            ppo_cfg.clip_eps = float(cfg_overrides["ppo_clip"])  # type: ignore
+        if "slf_alpha" in cfg_overrides:
+            ppo_cfg.scope_alpha = float(cfg_overrides["slf_alpha"])  # type: ignore
+        if "slf_gamma" in cfg_overrides:
+            ppo_cfg.scope_gamma = float(cfg_overrides["slf_gamma"])  # type: ignore
+        if "mlp_layers" in cfg_overrides:
+            ppo_cfg.mlp_layers = int(cfg_overrides["mlp_layers"])  # type: ignore
+        # GAN
+        if "z_dim" in cfg_overrides:
+            gan_cfg.z_dim = int(cfg_overrides["z_dim"])  # type: ignore
+        if "deconv_layers" in cfg_overrides:
+            gan_cfg.g_layers = int(cfg_overrides["deconv_layers"])  # type: ignore
+        if "conv_layers" in cfg_overrides:
+            gan_cfg.d_layers = int(cfg_overrides["conv_layers"])  # type: ignore
+        if "recon_w" in cfg_overrides:
+            gan_cfg.recon_w = float(cfg_overrides["recon_w"])  # type: ignore
+    # Build the system (activation/dropout/branch depth from overrides)
+    activation = cfg_overrides.get("activation", "relu") if cfg_overrides else "relu"
+    dropout = float(cfg_overrides.get("dropout", 0.3)) if cfg_overrides else 0.3
+    branch_layers = int(cfg_overrides.get("conv_layers", 5)) if cfg_overrides else 5
+    mlp_layers = int(cfg_overrides.get("mlp_layers", 1)) if cfg_overrides else 1
+
+    sys = ActiveLearningSystem(
+        num_classes=num_classes,
+        device=device,
+        al_cfg=al_cfg,
+        ppo_cfg=ppo_cfg,
+        gan_cfg=gan_cfg,
+        num_branches=3,
+        branch_layers=branch_layers,
+        activation=activation,
+        mlp_layers=mlp_layers,
+        dropout=dropout,
+    )
+
+    # Apply learning rates if provided
+    if cfg_overrides:
+        for g in sys.opt_cls.param_groups:
+            g["lr"] = float(cfg_overrides.get("lr_cls", g["lr"]))
+        sys.gan.optG.param_groups[0]["lr"] = float(cfg_overrides.get("lr_g", sys.gan.optG.param_groups[0]["lr"]))
+        sys.gan.optD.param_groups[0]["lr"] = float(cfg_overrides.get("lr_d", sys.gan.optD.param_groups[0]["lr"]))
+
+    return sys
+
+
+# Fitness / evaluation ---------------------------------------------------------
+
+def fitness_eval(config: Dict[str, Any], labeled: Dataset, unlabeled: Dataset, device: torch.device) -> float:
+    """Lightweight fitness: run a tiny AL round and return validation proxy (acc − λ×labels)."""
+    sys = build_system(num_classes=2, device=device, cfg_overrides=config)
+    used, _ = sys.active_round(unlabeled, labeled, steps=48, label_budget=8, train_epochs=int(config.get("epochs", 8)))
+    sys.classifier.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in DataLoader(labeled, batch_size=64):
+            x, y = x.to(sys.device), y.to(sys.device)
+            logits, _ = sys.classifier(x)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += y.numel()
+    acc = correct / max(1, total)
+    score = acc - 0.001 * used
+    return float(score)
+
+
+def ml_abc_optimize(
+    labeled: Dataset,
+    unlabeled: Dataset,
+    space: HPSpace = HPSpace(),
+    cfg: MLABCConfig = MLABCConfig(),
+    seed: int = 42,
+    device: Optional[torch.device] = None,
+) -> Dict[str, Any]:
+    """Run ML-ABC over the Table 1 search space; return the best-found configuration."""
+    seed_everything(seed)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    solver = MLABCSolver(space, cfg)
+    def _evaluate(conf: Dict[str, Any]) -> float:
+        # Build tiny synthetic sets for relative fitness during HPO
+        labeled_s, unlabeled_s = tiny_synthetic_dataset(n_per_class=40)
+        return fitness_eval(conf, labeled_s, unlabeled_s, device)
+    best = solver.optimize(_evaluate)
+    return best
+
+
+# ==========================================================
+# Demo data & entrypoints
+# ==========================================================
+
+def tiny_synthetic_dataset(n_per_class: int = 60) -> Tuple[Dataset, Dataset]:
+    """Creates a tiny synthetic dataset with two classes to exercise the pipeline."""
+    class Toy(Dataset):
+        def __init__(self, n: int, cls: int):
+            self.n = n
+            self.cls = cls
+            self.tf = MRITransform()
+        def __len__(self):
+            return self.n
+        def __getitem__(self, idx):
+            rng = np.random.default_rng(seed=idx + self.cls * 1000)
+            img = rng.normal(loc=0.5 + 0.2 * self.cls, scale=0.15, size=(224, 224)).astype(np.float32)
+            img = np.clip(img, 0, 1)
+            img = (img * 255).astype(np.uint8)
+            x = self.tf(img)
+            y = self.cls
+            return x, y
+    ds0 = Toy(n_per_class, 0)
+    ds1 = Toy(n_per_class, 1)
+    class Concat(Dataset):
+        def __init__(self, a: Dataset, b: Dataset):
+            self.a, self.b = a, b
+            self.items = [(i, 0) for i in range(len(a))] + [(i, 1) for i in range(len(b))]
+        def __len__(self):
+            return len(self.items)
+        def __getitem__(self, idx):
+            i, c = self.items[idx]
+            return (self.a if c == 0 else self.b)[i]
+    full = Concat(ds0, ds1)
+    n_labeled = 10
+    labeled_idx = random.sample(range(len(full)), n_labeled)
+    unlabeled_idx = [i for i in range(len(full)) if i not in labeled_idx]
+    class Sub(Dataset):
+        def __init__(self, base: Concat, idxs: List[int]):
+            self.base = base
+            self.items = []
+            for i in idxs:
+                x, y = base[i]
+                path = f"mem://{i}"
+                self.items.append((path, y))
+                _MEM[path] = (x, y)
+        def __len__(self):
+            return len(self.items)
+        def __getitem__(self, idx):
+            path, y = self.items[idx]
+            x, y_true = _MEM[path]
+            return x, y_true
+    return Sub(full, labeled_idx), Sub(full, unlabeled_idx)
+
+
+_MEM: Dict[str, Tuple[torch.Tensor, int]] = {}
+
+
+def run_demo() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(13)
+    labeled, unlabeled = tiny_synthetic_dataset()
+
+    print("[DEMO] Running 3 AL rounds ...")
+    budget_total = 0
+    # Example overrides to show configurability
+    overrides = {
+        "activation": "relu",
+        "conv_layers": 4,
+        "deconv_layers": 4,
+        "mlp_layers": 2,
+        "dropout": 0.25,
+        "z_dim": 96,
+        "p_retain": 0.6,
+        "ppo_clip": 0.2,
+        "slf_alpha": 0.5,
+        "slf_gamma": 0.5,
+        "lr_cls": 1e-3,
+        "lr_g": 3e-3,
+        "lr_d": 2e-3,
+        "batch_size": 32,
+    }
+    system = build_system(num_classes=2, device=device, cfg_overrides=overrides)
+
+    for r in range(3):
+        used, losses = system.active_round(
+            unlabeled=unlabeled,
+            labeled=labeled,
+            steps=64,
+            label_budget=12,
+            train_epochs=8,
+        )
+        budget_total += used
+        print(f"  Round {r+1}: labels used={used}, PPO loss={losses}")
+
+    print("[DEMO] Validating on labeled set...")
+    system.classifier.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for x, y in DataLoader(labeled, batch_size=64):
+            x, y = x.to(system.device), y.to(system.device)
+            logits, _ = system.classifier(x)
+            pred = logits.argmax(dim=1)
+            correct += int((pred == y).sum().item())
+            total += y.numel()
+    print(f"  Accuracy on labeled set: {correct / max(1, total):.3f}")
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Stroke Active Learning Pipeline (Revised)")
+    parser.add_argument("--demo", action="store_true", help="Run a tiny synthetic demo")
+    parser.add_argument("--data_root", type=str, default=None, help="Path to dataset root (folder per class)")
+    parser.add_argument("--dataset", type=str, default="BMRID", choices=["ISLES", "BMRID"], help="Dataset alias")
+    parser.add_argument("--hpo", action="store_true", help="Run ML-ABC hyperparameter search (Table 1 space)")
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed_everything(42)
+
+    if args.demo or args.data_root is None:
+        labeled, unlabeled = tiny_synthetic_dataset()
+        if args.hpo:
+            best = ml_abc_optimize(labeled, unlabeled, device=device)
+            print("[HPO] Best config:", json.dumps(best, indent=2))
+        run_demo()
+    else:
+        transform = MRITransform()
+        ds = SimpleFolderMRIDataset(args.data_root, transform=transform)
+        idxs = list(range(len(ds)))
+        random.shuffle(idxs)
+        n_labeled = max(10, len(ds) // 50)
+        labeled_idx = idxs[:n_labeled]
+        unlabeled_idx = idxs[n_labeled:]
+        class Sub(Dataset):
+            def __init__(self, base: SimpleFolderMRIDataset, idxs: List[int]):
+                self.base = base
+                self.items = [base.items[i] for i in idxs]
+            def __len__(self):
+                return len(self.items)
+            def __getitem__(self, idx):
+                path, y = self.items[idx]
+                if path.endswith(".npy"):
+                    img = np.load(path)
+                elif path.endswith(".pt"):
+                    img = torch.load(path).numpy()
+                else:
+                    from PIL import Image
+                    img = np.array(Image.open(path).convert("L"))
+                x = transform(img)
+                return x, y
+        labeled_ds = Sub(ds, labeled_idx)
+        unlabeled_ds = Sub(ds, unlabeled_idx)
+
+        # Run ML-ABC if requested, else default system
+        if args.hpo:
+            best = ml_abc_optimize(labeled_ds, unlabeled_ds, device=device)
+            print("[HPO] Best config:", json.dumps(best, indent=2))
+            system = build_system(num_classes=len(ds.class_to_idx), device=device, cfg_overrides=best)
+        else:
+            system = build_system(num_classes=len(ds.class_to_idx), device=device)
+
+        rounds = 5
+        total_budget = len(unlabeled_ds) // 10
+        per_round = max(1, total_budget // rounds)
+        for r in range(rounds):
+            used, losses = system.active_round(
+                unlabeled=unlabeled_ds,
+                labeled=labeled_ds,
+                steps=200,
+                label_budget=per_round,
+                train_epochs=8,
+            )
+            print(f"[Round {r+1}] labels used={used} losses={losses}")
+
+        print("Training complete.")
