@@ -1,0 +1,486 @@
+"""
+Stroke Active Learning Pipeline (from paper-inspired design)
+
+Modules:
+  - data: ISLES/BMRID loaders + preprocessing
+  - gan: Online augmentation GAN with selective gradient omission
+  - model: Multi-branch CNN classifier
+  - rl: PPO agent with Scope Loss (SLF) for active learning sample selection
+  - al_loop: End-to-end active learning cycle integrating classifier, RL agent, and GAN
+  - hpo: Random-Key + Mutual-Learning Artificial Bee Colony (ML-ABC) hyperparameter optimizer
+
+Notes:
+  • Code is written to be executable end-to-end on 2D slices; adjust I/O paths for real datasets.
+  • Comments and docstrings are in English as requested.
+  • Heavy training is parameterized; defaults run a tiny demo if invoked with --demo.
+
+Author: Python Assistant
+"""
+from __future__ import annotations
+
+import os
+import math
+import random
+import time
+import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+
+
+# ==========================================================
+# utils
+# ==========================================================
+
+def seed_everything(seed: int = 42) -> None:
+    """Set random seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def to_device(batch: Any, device: torch.device) -> Any:
+    """Recursively moves tensors in a nested structure to device."""
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, (list, tuple)):
+        return type(batch)(to_device(x, device) for x in batch)
+    if isinstance(batch, dict):
+        return {k: to_device(v, device) for k, v in batch.items()}
+    return batch
+
+
+# ==========================================================
+# data: ISLES / BMRID loaders
+# ==========================================================
+
+class MRITransform:
+    """Preprocessing composed of resize -> [0,1] scale -> z-score -> optional blur/equalize.
+
+    This mirrors the paper's preprocessing: resize to 224, scale to [0,1], z-score per scan,
+    Gaussian smoothing, optional histogram equalization.
+    """
+
+    def __init__(self, apply_blur: bool = True, apply_eq: bool = False, image_size: int = 224):
+        self.apply_blur = apply_blur
+        self.apply_eq = apply_eq
+        self.image_size = image_size
+        ops = [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),  # converts to [0,1]
+        ]
+        self.base = transforms.Compose(ops)
+        self.blur = transforms.GaussianBlur(kernel_size=3) if apply_blur else None
+
+    def __call__(self, img: np.ndarray) -> torch.Tensor:
+        # img expected as HxW or HxWxC array in uint8 or float [0, 255]
+        if img.ndim == 2:
+            img = np.expand_dims(img, -1)
+        if img.shape[2] == 1:  # grayscale -> 3ch
+            img = np.repeat(img, 3, axis=2)
+        img = img.astype(np.float32)
+        if img.max() > 1.5:
+            img = img / 255.0
+        ten = self.base(img)
+        if self.blur is not None:
+            ten = self.blur(ten)
+        if self.apply_eq:
+            # simple per-channel histogram equalization via ranking (approx)
+            ten = torch.stack([_rank_equalize(ten[c]) for c in range(ten.shape[0])], dim=0)
+        # z-score per image
+        mean = ten.mean()
+        std = ten.std().clamp_min(1e-6)
+        ten = (ten - mean) / std
+        return ten
+
+
+def _rank_equalize(channel: torch.Tensor) -> torch.Tensor:
+    """Approximate histogram equalization using rank-based mapping per image channel."""
+    flat = channel.flatten()
+    ranks = flat.argsort().argsort().float() / (flat.numel() - 1)
+    return ranks.view_as(channel)
+
+
+class SimpleFolderMRIDataset(Dataset):
+    """Generic folder dataset.
+
+    Expected structure:
+      root/
+        class_0/
+          img_*.npy | .pt | .png | .jpg
+        class_1/
+          ...
+    
+    • For MRI volumes, provide pre-extracted 2D slices as images or .npy arrays.
+    • This example treats each file as one image (2D). Extend to 3D if needed.
+    """
+
+    def __init__(self, root: str, transform: Optional[callable] = None):
+        super().__init__()
+        self.root = root
+        self.transform = transform or MRITransform()
+        self.items: List[Tuple[str, int]] = []
+        classes = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        for c in classes:
+            cdir = os.path.join(root, c)
+            for fname in os.listdir(cdir):
+                if any(fname.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".npy", ".pt")):
+                    self.items.append((os.path.join(cdir, fname), self.class_to_idx[c]))
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        path, label = self.items[idx]
+        if path.endswith(".npy"):
+            img = np.load(path)
+        elif path.endswith(".pt"):
+            img = torch.load(path).numpy()
+        else:
+            # Load with PIL via torchvision
+            from PIL import Image
+            img = np.array(Image.open(path).convert("L"))
+        x = self.transform(img)
+        y = label
+        return x, y
+
+
+# Convenience aliases the paper mentions (ISLES / BMRID) for clarity
+ISLESDataset = SimpleFolderMRIDataset
+BMRIDDataset = SimpleFolderMRIDataset
+
+
+# ==========================================================
+# GAN for online augmentation w/ selective gradient omission
+# ==========================================================
+
+class DiscFeatures(nn.Module):
+    """Discriminator returning features from last conv block and real/fake logits.
+
+    Architecture matches paper text: 3 conv blocks, BN, LeakyReLU, strides 1/2/2, kernel 3x3, pad 1.
+    """
+
+    def __init__(self, in_ch: int = 3, base: int = 64):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, base, 3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(base)
+        self.conv2 = nn.Conv2d(base, base * 2, 3, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(base * 2)
+        self.conv3 = nn.Conv2d(base * 2, base * 4, 3, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(base * 4)
+        self.head = nn.Linear(base * 4 * 56 * 56, 1)  # assuming 224x224 input
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = F.leaky_relu(self.bn1(self.conv1(x)), negative_slope=0.2)
+        h = F.leaky_relu(self.bn2(self.conv2(h)), negative_slope=0.2)
+        h = F.leaky_relu(self.bn3(self.conv3(h)), negative_slope=0.2)
+        feat = h.view(h.size(0), -1)
+        logit = self.head(feat)
+        return feat, logit
+
+
+class Generator(nn.Module):
+    """Deconvolutional generator with dual input: noise z and optional discriminator features.
+
+    Deconv blocks: 4x 4x4 / stride 2 / pad 1; ReLU except final Tanh.
+    If cond features given, they are projected and concatenated to z before upsampling.
+    """
+
+    def __init__(self, z_dim: int = 100, feat_dim: int = 56 * 56 * 256, out_ch: int = 3, base: int = 64):
+        super().__init__()
+        self.feat_proj = nn.Linear(feat_dim, z_dim)
+        self.fc = nn.Linear(z_dim, base * 8 * 14 * 14)
+        self.deconv1 = nn.ConvTranspose2d(base * 8, base * 4, 4, stride=2, padding=1)
+        self.bn1 = nn.BatchNorm2d(base * 4)
+        self.deconv2 = nn.ConvTranspose2d(base * 4, base * 2, 4, stride=2, padding=1)
+        self.bn2 = nn.BatchNorm2d(base * 2)
+        self.deconv3 = nn.ConvTranspose2d(base * 2, base, 4, stride=2, padding=1)
+        self.bn3 = nn.BatchNorm2d(base)
+        self.deconv4 = nn.ConvTranspose2d(base, out_ch, 4, stride=2, padding=1)
+
+    def forward(self, z: torch.Tensor, cond_feat: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if cond_feat is not None:
+            cf = self.feat_proj(cond_feat)
+            z = z + cf  # simple fusion
+        h = self.fc(z)
+        h = h.view(h.size(0), -1, 14, 14)
+        h = F.relu(self.bn1(self.deconv1(h)))
+        h = F.relu(self.bn2(self.deconv2(h)))
+        h = F.relu(self.bn3(self.deconv3(h)))
+        x = torch.tanh(self.deconv4(h))
+        return x
+
+
+@dataclass
+class GANConfig:
+    z_dim: int = 100
+    topk_frac: float = 0.2  # fraction of strongest D responses to omit for G update
+    lr_g: float = 6e-3
+    lr_d: float = 2e-3
+    recon_w: float = 0.3  # optional L1 towards real sample
+
+
+class OnlineAugGAN:
+    """GAN wrapper implementing online augmentation with selective gradient omission.
+
+    Usage:
+        gan = OnlineAugGAN(device)
+        batch = gan.maybe_augment(real_batch, labels, p_retain=0.6)
+    """
+
+    def __init__(self, device: torch.device, cfg: GANConfig = GANConfig()):
+        self.device = device
+        self.cfg = cfg
+        self.D = DiscFeatures().to(device)
+        self.G = Generator(z_dim=cfg.z_dim).to(device)
+        self.optD = torch.optim.Adam(self.D.parameters(), lr=cfg.lr_d, betas=(0.5, 0.999))
+        self.optG = torch.optim.Adam(self.G.parameters(), lr=cfg.lr_g, betas=(0.5, 0.999))
+
+    @torch.no_grad()
+    def _disc_feat(self, x: torch.Tensor) -> torch.Tensor:
+        feat, _ = self.D(x)
+        return feat
+
+    def train_step(self, real: torch.Tensor) -> None:
+        """One adversarial step with selective omission on generator update."""
+        b = real.size(0)
+        z = torch.randn(b, self.cfg.z_dim, device=self.device)
+
+        # ---------------- D step ----------------
+        self.optD.zero_grad()
+        feat_r, logit_r = self.D(real)
+        fake = self.G(z, feat_r.detach())
+        feat_f, logit_f = self.D(fake.detach())
+        loss_d = F.softplus(-logit_r).mean() + F.softplus(logit_f).mean()
+        loss_d.backward()
+        self.optD.step()
+
+        # ---------------- G step with selective omission ----------------
+        self.optG.zero_grad()
+        # re-evaluate with current D
+        feat_r, _ = self.D(real)
+        fake = self.G(z, feat_r.detach())
+        _, logit_f2 = self.D(fake)
+        # Top-k omission: omit gradients for samples with top-k highest D scores
+        k = max(1, int(self.cfg.topk_frac * b))
+        scores = logit_f2.detach().view(-1)
+        topk_idx = torch.topk(scores, k=k, largest=True).indices
+        weight = torch.ones_like(scores)
+        weight[topk_idx] = 0.0
+        loss_vec = F.softplus(-logit_f2.view(-1))  # generator tries to increase D(fake)
+        # Optional L1 reconstruction towards a random real image in the batch
+        recon = self.cfg.recon_w * (fake - real[torch.randperm(b, device=self.device)]).abs().mean(dim=(1, 2, 3))
+        loss_g = ((loss_vec + recon) * weight).sum() / weight.clamp_min(1e-6).sum()
+        loss_g.backward()
+        self.optG.step()
+
+    def maybe_augment(self, batch_x: torch.Tensor, labels: torch.Tensor, p_retain: float = 0.6) -> torch.Tensor:
+        """Implements Algorithm 1: online augmentation inside a mini-batch.
+
+        For each image, with probability (1 - p_retain), replace with a GAN sample.
+        Conditioning uses discriminator features of the current image.
+        """
+        self.train_step(batch_x)
+        with torch.no_grad():
+            b = batch_x.size(0)
+            feat = self._disc_feat(batch_x)
+            z = torch.randn(b, self.cfg.z_dim, device=self.device)
+            gen = self.G(z, feat)
+            mask = (torch.rand(b, device=self.device) > p_retain).float().view(-1, 1, 1, 1)
+            aug = batch_x * (1 - mask) + gen * mask
+        return aug
+
+
+# ==========================================================
+# Classifier: multi-branch CNN per paper
+# ==========================================================
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=2, stride=3, padding=4)
+        self.bn = nn.BatchNorm2d(out_ch)
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pool(F.relu(self.bn(self.conv(x))))
+        return x
+
+
+class BranchCNN(nn.Module):
+    """Five-layer CNN with channels 128->8 decreasing as described."""
+
+    def __init__(self, in_ch: int = 3):
+        super().__init__()
+        chans = [128, 64, 32, 16, 8]
+        layers: List[nn.Module] = []
+        c_in = in_ch
+        for c in chans:
+            layers.append(ConvBlock(c_in, c))
+            c_in = c
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        return torch.flatten(h, 1)
+
+
+class MultiBranchClassifier(nn.Module):
+    """Stacks multiple CNN branches, concatenates features, then FC for classification."""
+
+    def __init__(self, num_classes: int = 2, in_ch: int = 3, num_branches: int = 3, feat_dim: int = 256):
+        super().__init__()
+        self.branches = nn.ModuleList([BranchCNN(in_ch) for _ in range(num_branches)])
+        # Infer flatten size with a dummy forward
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, 224, 224)
+            fsz = self.branches[0](dummy).numel()
+        self.fc = nn.Sequential(
+            nn.Linear(num_branches * fsz, feat_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(feat_dim, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        feats = [b(x) for b in self.branches]
+        fcat = torch.cat(feats, dim=1)
+        logits = self.fc(fcat)
+        return logits, fcat
+
+
+# ==========================================================
+# RL with Scope Loss (PPO-style) for Active Learning
+# ==========================================================
+
+@dataclass
+class PPOConfig:
+    gamma: float = 0.99
+    lam: float = 0.95
+    clip_eps: float = 0.2
+    lr: float = 1e-3
+    entropy_coef: float = 0.01
+    scope_alpha: float = 0.5  # scales scope vs advantage
+    scope_gamma: float = 2.0  # focusing factor (like focal loss gamma)
+    train_iters: int = 4
+    batch_size: int = 64
+
+
+class PolicyNet(nn.Module):
+    """Small MLP policy over state -> action (2) and value."""
+
+    def __init__(self, state_dim: int, hidden: int = 256):
+        super().__init__()
+        self.pi = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(), nn.Linear(hidden, 2)
+        )
+        self.v = nn.Sequential(
+            nn.Linear(state_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1)
+        )
+
+    def forward(self, s: torch.Tensor) -> Tuple[torch.distributions.Categorical, torch.Tensor]:
+        logits = self.pi(s)
+        dist = torch.distributions.Categorical(logits=logits)
+        v = self.v(s).squeeze(-1)
+        return dist, v
+
+
+class TrajBuffer:
+    def __init__(self):
+        self.s = []
+        self.a = []
+        self.logp = []
+        self.r = []
+        self.v = []
+        self.done = []
+
+    def add(self, s, a, logp, r, v, d):
+        self.s.append(s)
+        self.a.append(a)
+        self.logp.append(logp)
+        self.r.append(r)
+        self.v.append(v)
+        self.done.append(d)
+
+    def get(self):
+        return (
+            torch.stack(self.s),
+            torch.tensor(self.a, dtype=torch.long),
+            torch.stack(self.logp),
+            torch.tensor(self.r, dtype=torch.float32),
+            torch.stack(self.v),
+            torch.tensor(self.done, dtype=torch.float32),
+        )
+
+
+def compute_gae(r, v, done, gamma: float, lam: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generalized Advantage Estimation (vectorized over trajectory)."""
+    T = r.size(0)
+    adv = torch.zeros_like(r)
+    lastgaelam = 0.0
+    for t in reversed(range(T)):
+        nextv = v[t + 1] if t + 1 < T else 0.0
+        nonterminal = 1.0 - done[t]
+        delta = r[t] + gamma * nextv * nonterminal - v[t]
+        lastgaelam = delta + gamma * lam * nonterminal * lastgaelam
+        adv[t] = lastgaelam
+    ret = adv + v
+    return adv, ret
+
+
+def scope_scale(prob: torch.Tensor, adv: torch.Tensor, alpha: float, gamma_f: float) -> torch.Tensor:
+    """Implements Scope Loss scaling factor.
+
+    • Normalize advantages with z-score within batch
+    • scope = (1 - prob) ** gamma_f * (alpha + |adv_z|)
+    • Returns multiplicative factor for policy loss term
+    """
+    adv_z = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+    scope = torch.pow(1.0 - prob.detach().clamp(1e-6, 1.0), gamma_f) * (alpha + adv_z.abs())
+    return scope.detach()  # used as weight
+
+
+class PPOWithScope:
+    def __init__(self, state_dim: int, cfg: PPOConfig, device: torch.device):
+        self.cfg = cfg
+        self.device = device
+        self.net = PolicyNet(state_dim).to(device)
+        self.opt = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
+
+    def update(self, buf: TrajBuffer) -> Dict[str, float]:
+        s, a, logp_old, r, v, done = buf.get()
+        s, a, logp_old, r, v, done = (
+            s.to(self.device),
+            a.to(self.device),
+            logp_old.to(self.device),
+            r.to(self.device),
+            v.to(self.device),
+            done.to(self.device),
+        )
+        adv, ret = compute_gae(r, v, done, self.cfg.gamma, self.cfg.lam)
+        adv = (adv - adv.mean()) / (adv.std().clamp_min(1e-6))
+
+        n = s.size(0)
+        idx = torch.randperm(n)
+        losses = {}
+        for _ in range(self.cfg.train_iters):
+            for start in range(0, n, self.cfg.batch_size):
+                end = min(n, start + self.cfg.batch_size)
+                mb = idx[start:end]
+                dist, v_pred = self.net(s[mb])
+                logp = dist.log_prob(a[mb])
+                ratio = torch.exp(logp - logp_old[mb])
+                prob_a = torch.exp(dist.logits.gather(1, a[mb].unsqueeze(1)).squeeze(1) - dist.logits.logsumexp(1))
+                # Scope factor scales the unclipped policy loss
+                scope = scope_scale(prob_a, adv[mb], self.cfg.scope_alpha, self.cfg.scope_gamma)
+                pg_unclipped = -ratio * adv[mb] * scope
